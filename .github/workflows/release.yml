@@ -40,9 +40,18 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -trimpath -ldflags "-s -w" -o limit-${{ matrix.goos }}-${{ matrix.goarch }} .
+        shell: bash
+        run: |
+          # Windows 发裸 .exe(下载即用); 其他平台发 tar.gz
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            go build -trimpath -ldflags "-s -w" -o limit-${{ matrix.goos }}-${{ matrix.goarch }}.exe .
+          else
+            go build -trimpath -ldflags "-s -w" -o limit-${{ matrix.goos }}-${{ matrix.goarch }} .
+          fi
 
-      - name: Package
+      - name: Package (non-windows only)
+        if: matrix.goos != 'windows'
+        shell: bash
         run: tar czf limit-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz limit-${{ matrix.goos }}-${{ matrix.goarch }}
 
       - name: Upload to release
