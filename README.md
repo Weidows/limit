@@ -39,7 +39,7 @@ limit.exe --cpu 10% --prio below --affinity 0,2-5 -- ffmpeg -i in.mp4 out.mkv
 | `--cpu <百分比>` | CPU 硬顶（调度器级强制执行） |
 | `--mem <大小>` | 单进程 commit 内存硬顶（`512M`/`4G`） |
 | `--mem-total <大小>` | 整棵树 commit 内存硬顶 |
-| `--io <MB/s>` | 磁盘 IO 速率上限（读写合计口径） |
+| `--io <MB/s>` | 磁盘 IO 速率上限（**整 Job 读写合计**，实测聚合口径） |
 | `--procs <个数>` | 进程数上限（含子进程树） |
 | `--affinity <掩码>` | CPU 亲和性（`0x0F` 或 `0,2-5`） |
 | `--prio <级别>` | `idle\|below\|normal\|above\|high` |
@@ -54,10 +54,14 @@ limit.exe --cpu 10% --prio below --affinity 0,2-5 -- ffmpeg -i in.mp4 out.mkv
 2. **`--mem` 是 commit 口径的硬顶**：撞顶时 `VirtualAlloc` 直接失败
    （`ERROR_COMMITMENT_LIMIT` 1455），行为类似 cgroup 的 `memory.max`。
    **RSS（工作集）Windows 只有软限**——Job 的 WorkingSet 限制不保证硬顶，这是 OS 语义。
-3. **`--io` 是读写合计口径**，且只对「无缓冲/写穿透」IO 精确生效；
-   7z/Bandizip 这类默认缓存写的程序，进程退出后由系统 lazy writer 全速回写，**会逃过限制**
+3. **`--io` 是整 Job 读写合计口径，且实测为聚合配额（非按盘独立）**：
+   同一 Job 内两个并行直写拷贝（C:→D: 与 C:→E:，共 1016MB 流量）在 50MB/s 下
+   各跑 17.2s/20.2s（合计 ≈50MB/s）；若按文档所说「每盘独立 50MB/s」则应各 ~10.2s。
+   只对「无缓冲/写穿透」IO 精确生效——7z/Bandizip 这类默认缓存写的程序，
+   进程退出后由系统 lazy writer 全速回写，**会逃过限制**
    （实测磁盘仍 188MB/s 爆发 + 长尾）。解压/拷贝要稳定限速请用
    [io7z](https://github.com/Weidows/io7z) 的分段节流方案。
+   *文档另称 VolumeName=NULL 时按盘独立、且 Win10 1607+ 不支持——均与实测不符，以实测为准。*
 4. **整棵进程树生效**：子进程自动继承 Job。启动采用「挂起创建 → 入 Job → 恢复」，
    开头几毫秒也不漏。
 5. **不能在已有 Job/容器里跑 limit**（嵌套 Job 限制）：`AssignProcessToJobObject` 会失败，

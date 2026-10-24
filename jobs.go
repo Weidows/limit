@@ -120,6 +120,7 @@ type jobObjectBasicAccountingInformation struct {
 }
 
 // JOBOBJECT_IO_RATE_CONTROL_INFORMATION
+// 注意: 文档称 VolumeName=NULL 时按盘独立配额, 实测(双盘并行拷贝)为整 Job 聚合, 以实测为准
 type ioRateControlInformation struct {
 	MaxIops         int64
 	MaxBandwidth    int64
