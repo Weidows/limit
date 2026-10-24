@@ -42,17 +42,12 @@ jobs:
           CGO_ENABLED: 0
         shell: bash
         run: |
-          # Windows 发裸 .exe(下载即用); 其他平台发 tar.gz
+          # 全平台发裸二进制, Windows 补 .exe 后缀
           if [ "${{ matrix.goos }}" = "windows" ]; then
             go build -trimpath -ldflags "-s -w" -o limit-${{ matrix.goos }}-${{ matrix.goarch }}.exe .
           else
             go build -trimpath -ldflags "-s -w" -o limit-${{ matrix.goos }}-${{ matrix.goarch }} .
           fi
-
-      - name: Package (non-windows only)
-        if: matrix.goos != 'windows'
-        shell: bash
-        run: tar czf limit-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz limit-${{ matrix.goos }}-${{ matrix.goarch }}
 
       - name: Upload to release
         env:
