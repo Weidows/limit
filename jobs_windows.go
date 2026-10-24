@@ -9,7 +9,8 @@ package main
 
 import (
 	"fmt"
-	"os"
+	"math"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -28,9 +29,6 @@ var (
 	procGetExitCodeProcess        = kernel32.NewProc("GetExitCodeProcess")
 	procSetPriorityClass          = kernel32.NewProc("SetPriorityClass")
 	procCloseHandle               = kernel32.NewProc("CloseHandle")
-	procGetStdHandle              = kernel32.NewProc("GetStdHandle")
-	procGetConsoleMode            = kernel32.NewProc("GetConsoleMode")
-	procWriteConsoleW             = kernel32.NewProc("WriteConsoleW")
 
 	// Job Object I/O rate control: 运行时解析, Win7 及更早不存在
 	procSetIoRateControlInformationJobObject = kernel32.NewProc("SetIoRateControlInformationJobObject")
@@ -59,7 +57,6 @@ const (
 const (
 	createSuspended = 0x00000004
 	infinite        = 0xFFFFFFFF
-	stdErrorHandle  = 0xFFFFFFF4 // (DWORD)-12, GetStdHandle 参数
 )
 
 // 优先级类
@@ -285,22 +282,159 @@ func setIoRateControl(job syscall.Handle, maxBandwidthBytes, maxIops int64) erro
 	return nil
 }
 
-// ---------- 控制台输出(中文不乱码) ----------
+// ---------- 执行(仅 Windows) ----------
 
-// eprintf 写到 stderr: 是控制台时走 WriteConsoleW(UTF-16), 被重定向时写 UTF-8 字节。
-// C 版靠 fwprintf 的代码页转换; Go 若直接写 UTF-8 到 GBK 控制台会乱码, 故需此函数。
-func eprintf(format string, args ...any) {
-	s := fmt.Sprintf(format, args...)
-	h, _, _ := procGetStdHandle.Call(stdErrorHandle)
-	var mode uint32
-	if r, _, _ := procGetConsoleMode.Call(h, uintptr(unsafe.Pointer(&mode))); r != 0 && h != 0 {
-		u16, err := syscall.UTF16FromString(s)
-		if err == nil {
-			var written uint32
-			procWriteConsoleW.Call(h, uintptr(unsafe.Pointer(&u16[0])),
-				uintptr(len(u16)), uintptr(unsafe.Pointer(&written)), 0)
-			return
+// prioClassValue 把 --prio 字符串映射为优先级类常量(仅 Windows 路径使用)。
+func prioClassValue(p string) uint32 {
+	switch p {
+	case "idle":
+		return idlePriorityClass
+	case "below":
+		return belowNormalPriorityClass
+	case "normal":
+		return normalPriorityClass
+	case "above":
+		return aboveNormalPriorityClass
+	default:
+		return highPriorityClass
+	}
+}
+
+// runWindows 创建 Job、施加限制、挂起启动子进程入 Job, 等待并打印统计。
+func runWindows(L *limits, cmdArgs []string) int {
+	// 组装子进程命令行(按需加引号)
+	parts := make([]string, 0, len(cmdArgs))
+	for _, a := range cmdArgs {
+		parts = append(parts, quoteArg(a))
+	}
+	cmdline := strings.Join(parts, " ")
+
+	// ---- 创建 Job 并施加限制 ----
+	job, err := createJobObject()
+	if err != nil {
+		eprintf("[limit] CreateJobObject 失败: %v\n", err)
+		return 1
+	}
+	defer closeHandle(job)
+
+	var eli jobObjectExtendedLimitInformation
+	if L.mem != 0 {
+		eli.BasicLimitInformation.LimitFlags |= jobObjectLimitProcessMemory
+		eli.ProcessMemoryLimit = L.mem
+	}
+	if L.memTotal != 0 {
+		eli.BasicLimitInformation.LimitFlags |= jobObjectLimitJobMemory
+		eli.JobMemoryLimit = L.memTotal
+	}
+	if L.procs != 0 {
+		eli.BasicLimitInformation.LimitFlags |= jobObjectLimitActiveProcess
+		eli.BasicLimitInformation.ActiveProcessLimit = L.procs
+	}
+	if L.haveAff {
+		eli.BasicLimitInformation.LimitFlags |= jobObjectLimitAffinity
+		eli.BasicLimitInformation.Affinity = L.affinity
+	}
+	if L.killOnClose {
+		eli.BasicLimitInformation.LimitFlags |= jobObjectLimitKillOnJobClose
+	}
+	if err := setInformationJobObject(job, jobObjectInfoClassExtendedLimit,
+		unsafe.Pointer(&eli), unsafe.Sizeof(eli)); err != nil {
+		eprintf("[limit] 设置扩展限制失败: %v\n", err)
+		return 1
+	}
+
+	if L.haveCPU {
+		c := jobObjectCpuRateControlInformation{
+			ControlFlags: jobObjectCpuRateControlEnable | jobObjectCpuRateControlHardCap,
+			CpuRate:      L.cpuRate,
+		}
+		if err := setInformationJobObject(job, jobObjectInfoClassCpuRateControl,
+			unsafe.Pointer(&c), unsafe.Sizeof(c)); err != nil {
+			eprintf("[limit] 设置 CPU 硬顶失败: %v\n", err)
+			return 1
 		}
 	}
-	fmt.Fprint(os.Stderr, s)
+
+	if L.ioMBps > 0 || L.ioIops > 0 {
+		bw := int64(L.ioMBps * 1024 * 1024)
+		iops := int64(math.Round(L.ioIops))
+		if err := setIoRateControl(job, bw, iops); err != nil {
+			eprintf("[limit] 设置 IO 限速失败: %v\n", err)
+			return 1
+		}
+		eprintf("[limit] 注意: IO 限速对缓存写不保证(回写会爆发), 直写/写穿透 IO 才精确生效\n")
+	}
+
+	// ---- 挂起启动 -> 入 Job -> 恢复 ----
+	pi, err := createProcessSuspended(cmdline)
+	if err != nil {
+		eprintf("[limit] 启动失败(%v): %s\n", err, cmdline)
+		return 1
+	}
+	if err := assignProcessToJobObject(job, pi.HProcess); err != nil {
+		eprintf("[limit] 加入 Job 失败: %v (进程可能已在别的 Job/容器里)\n", err)
+		terminateProcess(pi.HProcess, 1)
+		closeHandle(pi.HProcess)
+		closeHandle(pi.HThread)
+		return 1
+	}
+	if L.havePrio {
+		setPriorityClass(pi.HProcess, prioClassValue(L.prio))
+	}
+	if err := resumeThread(pi.HThread); err != nil {
+		eprintf("[limit] 恢复子进程失败: %v\n", err)
+	}
+
+	// ---- 摘要行 ----
+	summary := fmt.Sprintf("[limit] 运行中 (pid %d):", pi.DwProcessId)
+	if L.haveCPU {
+		summary += fmt.Sprintf(" cpu<=%.2f%%", float64(L.cpuRate)/100)
+	}
+	if L.mem != 0 {
+		summary += fmt.Sprintf(" mem<=%.0fMB", float64(L.mem)/1e6)
+	}
+	if L.memTotal != 0 {
+		summary += fmt.Sprintf(" mem_total<=%.0fMB", float64(L.memTotal)/1e6)
+	}
+	if L.ioMBps > 0 {
+		summary += fmt.Sprintf(" io<=%.0fMB/s", L.ioMBps)
+	}
+	if L.ioIops > 0 {
+		summary += fmt.Sprintf(" iops<=%.0f/s", L.ioIops)
+	}
+	if L.procs != 0 {
+		summary += fmt.Sprintf(" procs<=%d", L.procs)
+	}
+	if L.haveAff {
+		summary += fmt.Sprintf(" affinity=%#x", L.affinity)
+	}
+	if L.havePrio {
+		summary += fmt.Sprintf(" prio=%#x", L.prio)
+	}
+	eprintf("%s\n", summary)
+
+	if err := waitForSingleObject(pi.HProcess); err != nil {
+		eprintf("[limit] 等待子进程失败: %v\n", err)
+	}
+	code, err := getExitCodeProcess(pi.HProcess)
+	if err != nil {
+		eprintf("[limit] 获取退出码失败: %v\n", err)
+	}
+	closeHandle(pi.HProcess)
+	closeHandle(pi.HThread)
+
+	// ---- 退出统计 ----
+	var acc jobObjectBasicAccountingInformation
+	if err := queryInformationJobObject(job, jobObjectInfoClassBasicAccounting,
+		unsafe.Pointer(&acc), unsafe.Sizeof(acc)); err == nil {
+		eprintf("[limit] 退出码 %d | CPU 时间 user %.2fs + kernel %.2fs\n",
+			code, float64(acc.TotalUserTime)/1e7, float64(acc.TotalKernelTime)/1e7)
+	}
+	var q jobObjectExtendedLimitInformation
+	if err := queryInformationJobObject(job, jobObjectInfoClassExtendedLimit,
+		unsafe.Pointer(&q), unsafe.Sizeof(q)); err == nil {
+		eprintf("[limit] 峰值 commit: 单进程 %.0f MB / 整棵树 %.0f MB\n",
+			float64(q.PeakProcessMemoryUsed)/1e6, float64(q.PeakJobMemoryUsed)/1e6)
+	}
+	return int(code)
 }

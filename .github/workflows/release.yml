@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -20,6 +20,14 @@ jobs:
             goarch: arm64
           - goos: windows
             goarch: 386
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
     steps:
       - uses: actions/checkout@v4
 
@@ -32,9 +40,12 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -trimpath -ldflags "-s -w" -o limit-${{ matrix.goos }}-${{ matrix.goarch }}.exe .
+        run: go build -trimpath -ldflags "-s -w" -o limit-${{ matrix.goos }}-${{ matrix.goarch }} .
+
+      - name: Package
+        run: tar czf limit-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz limit-${{ matrix.goos }}-${{ matrix.goarch }}
 
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.event.release.tag_name }} limit-${{ matrix.goos }}-${{ matrix.goarch }}.exe --clobber
+        run: gh release upload ${{ github.event.release.tag_name }} limit-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz --clobber

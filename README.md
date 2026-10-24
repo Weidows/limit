@@ -1,8 +1,8 @@
 # limit
 
-**Windows 通用程序资源限制器 — Job Object 版 cgroup**
+**通用程序资源限制器 — Windows 上是 Job Object 版 cgroup**
 
-[![Platform](https://img.shields.io/badge/platform-Windows%208%2B-0078D6?logo=windows95&logoColor=white)](#)
+[![Platform](https://img.shields.io/badge/platform-Windows%208%2B%20%7C%20Linux%20%7C%20macOS-0078D6?logo=windows95&logoColor=white)](#)
 [![Go](https://img.shields.io/badge/Go-stdlib%20only-00ADD8?logo=go&logoColor=white)](#)
 [![Deps](https://img.shields.io/badge/deps-0-brightgreen)](#)
 [![Admin](https://img.shields.io/badge/admin-not%20required-success)](#)
@@ -12,6 +12,10 @@
 
 Job Object 就是 Windows 原生的「进程组资源容器」——Windows 容器本身正是用它实现的,
 所以这不是山寨 Docker,而是用对了 Windows 自己的机制。
+
+**平台说明**:发布件覆盖 windows(amd64/arm64/386)、linux、macOS 全平台,但限制机制
+是 Windows Job Object——非 Windows 平台的二进制可以正常解析选项(`--help` 可用),
+执行时明确报错退出,不静默放行;linux 下等价能力是 cgroup v2,尚未移植。
 
 ## 快速上手
 
@@ -56,7 +60,8 @@ go install github.com/Weidows/limit@latest
 go build -o limit.exe .
 ```
 
-GitHub Release 附带自动构建的 amd64 / arm64 / 386 三档 Windows exe(发布 release 时 CI 产出)。
+GitHub Release 附带 CI 自动构建的全平台压缩包:windows amd64/arm64/386、
+linux amd64/arm64、macOS amd64/arm64(发布 release 时产出;非 Windows 件为明确报错的占位,见「平台说明」)。
 
 单文件 exe,Win8+(IO 限速 API 需 Win8),无需管理员。
 
@@ -115,6 +120,9 @@ GitHub Release 附带自动构建的 amd64 / arm64 / 386 三档 Windows exe(发�
 - **纯标准库 + `syscall.NewLazyDLL` 直调 kernel32**:Go 的 `NewProc` 内部就是
   LoadLibrary/GetProcAddress,C 版因 mingw 导入库缺符号而手写 GetProcAddress 的绕法
   在这里不需要;IO 限速 API 用 `Find()` 预检存在性,不存在时明确报错。
+- **平台分离**:`jobs_windows.go`(文件名即构建标签)承载全部 Win32 调用;
+  非 Windows 平台由 `run_other.go`/`eprintf_other.go` 兜底——选项解析与 `--help` 全平台一致,
+  执行时明确报错,不做静默放行。
 - **结构体布局有回归测试**:`jobs_test.go` 的 `TestStructLayouts` 与
   `legacy/layout.c`(gcc 实测的 sizeof/offsetof)逐一断言——改结构体前先重跑 layout.exe,
   不要凭记忆改字段。
