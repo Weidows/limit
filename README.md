@@ -89,6 +89,7 @@ Windows 版要求 Win8+(IO 限速 API 需 Win8),免管理员。
 | `--io 50` | 直写拷贝 254MB | 10.07s(单向 26.5MB/s,读写合计 53MB/s ≈ 上限)✅ |
 | `--iops 100` | 300 次写穿透小 IO(4KB create+write+close) | 0.55s → 25.1s,压到 ≈100 IO 操作/s(create/close 元数据也计数)✅ |
 | `--io 100 --iops 100` | 同上 | API 接受双顶,IOPS 先撞顶生效 ✅ |
+| `--cpu/--io/--iops` × robocopy | 17000 文件/660MB 缓存写拷贝(见下方注意) | 基线 6.3s@112MB/s;`--cpu 25%` 9.6s@73MB/s;`--io 10` 11.8s@60MB/s;`--iops 100` 34.7s@27MB/s;`--iops 30` 92.9s@7.5MB/s——四类顶全部压得住,梯度与档位一致 ✅ |
 | `--affinity 0x1` | 2 线程烧 6 秒 | CPU 5.55s(绑 1 核)✅ |
 | `--procs 1` | cmd 里再起 cmd | 孙进程创建被拒,退出码 1 ✅ |
 
