@@ -2,7 +2,7 @@
 //
 // 用法:
 //
-//	limit [--cpu 25%] [--mem 512M] [--io 50MB/s] [--procs 8]
+//	limit [--cpu 25%] [--mem 512M] [--io 50MB/s] [--iops 100] [--procs 8]
 //	      [--affinity 0,2-5] [--prio below] [--no-kill-on-close] -- 7z x a.7z -oout\
 //
 // 边界(与 C 版一致, README 有详细说明):
@@ -27,6 +27,7 @@ type limits struct {
 	mem         uintptr
 	memTotal    uintptr
 	ioMBps      float64
+	ioIops      float64
 	procs       uint32
 	affinity    uintptr
 	haveAff     bool
@@ -141,6 +142,8 @@ func usage(me string) {
 	eprintf("  --mem <大小>        单进程 commit 内存硬顶, 如 512M / 4G\n")
 	eprintf("  --mem-total <大小>  整棵树 commit 内存硬顶\n")
 	eprintf("  --io <MB/s>         磁盘 IO 速率(读写合计; 直写精确, 缓存写不保证)\n")
+	eprintf("  --iops <次数/s>     IO 每秒操作数上限(读写合计; 可与 --io 并用, 谁先撞顶谁生效)\n")
+	eprintf("                      小文件场景 HDD 掉速时用它: 顺序大块走 --io, 随机小 IO 撞 --iops\n")
 	eprintf("  --procs <个数>      进程数上限\n")
 	eprintf("  --affinity <掩码>   CPU 亲和性, 如 0x0F 或 0,2-5\n")
 	eprintf("  --prio <级别>       idle|below|normal|above|high\n")
@@ -199,6 +202,14 @@ optLoop:
 				return 2
 			}
 			L.ioMBps = v
+			i += 2
+		case a == "--iops" && i+1 < len(args):
+			v, err := strconv.ParseFloat(args[i+1], 64)
+			if err != nil || v <= 0 {
+				eprintf("[limit] --iops 值无效: %s\n", args[i+1])
+				return 2
+			}
+			L.ioIops = v
 			i += 2
 		case a == "--procs" && i+1 < len(args):
 			v, err := strconv.Atoi(args[i+1])
@@ -302,12 +313,14 @@ optLoop:
 		}
 	}
 
-	if L.ioMBps > 0 {
-		if err := setIoRateControl(job, int64(L.ioMBps*1024*1024)); err != nil {
+	if L.ioMBps > 0 || L.ioIops > 0 {
+		bw := int64(L.ioMBps * 1024 * 1024)
+		iops := int64(math.Round(L.ioIops))
+		if err := setIoRateControl(job, bw, iops); err != nil {
 			eprintf("[limit] 设置 IO 限速失败: %v\n", err)
 			return 1
 		}
-		eprintf("[limit] 注意: IO 限速对缓存写不保证(回写会爆发), 直写 IO 才精确生效\n")
+		eprintf("[limit] 注意: IO 限速对缓存写不保证(回写会爆发), 直写/写穿透 IO 才精确生效\n")
 	}
 
 	// ---- 挂起启动 -> 入 Job -> 恢复 ----
@@ -343,6 +356,9 @@ optLoop:
 	}
 	if L.ioMBps > 0 {
 		summary += fmt.Sprintf(" io<=%.0fMB/s", L.ioMBps)
+	}
+	if L.ioIops > 0 {
+		summary += fmt.Sprintf(" iops<=%.0f/s", L.ioIops)
 	}
 	if L.procs != 0 {
 		summary += fmt.Sprintf(" procs<=%d", L.procs)

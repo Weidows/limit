@@ -265,13 +265,16 @@ func closeHandle(handle syscall.Handle) error {
 	return nil
 }
 
-func setIoRateControl(job syscall.Handle, maxBandwidthBytes int64) error {
+// 同时设带宽与 IOPS 两个顶, 哪个先撞上哪个生效; 传 0 表示该维度不限。
+// 顺序大块 IO 每个只算 1 次操作, 走带宽顶; 随机小 IO 才撞 IOPS 顶——正好对应 HDD 两类负载。
+func setIoRateControl(job syscall.Handle, maxBandwidthBytes, maxIops int64) error {
 	// Find() 内部即 GetProcAddress; 不存在时明确报错, 不静默
 	if err := procSetIoRateControlInformationJobObject.Find(); err != nil {
 		return fmt.Errorf("IO 限速 API 不可用(需 Win8+): %w", err)
 	}
 	io := ioRateControlInformation{
 		MaxBandwidth: maxBandwidthBytes,
+		MaxIops:      maxIops,
 		ControlFlags: jobObjectIoRateControlEnable,
 	}
 	r1, _, callErr := procSetIoRateControlInformationJobObject.Call(

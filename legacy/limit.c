@@ -124,6 +124,7 @@ static void usage(const wchar_t *me)
     fwprintf(stderr, L"  --mem <大小>        单进程 commit 内存硬顶, 如 512M / 4G\n");
     fwprintf(stderr, L"  --mem-total <大小>  整棵树 commit 内存硬顶\n");
     fwprintf(stderr, L"  --io <MB/s>         磁盘 IO 速率(读写合计; 直写精确, 缓存写不保证)\n");
+    fwprintf(stderr, L"  --iops <次数/s>     IO 每秒操作数上限(可与 --io 并用, 谁先撞顶谁生效)\n");
     fwprintf(stderr, L"  --procs <个数>      进程数上限\n");
     fwprintf(stderr, L"  --affinity <掩码>   CPU 亲和性, 如 0x0F 或 0,2-5\n");
     fwprintf(stderr, L"  --prio <级别>       idle|below|normal|above|high\n");
@@ -139,6 +140,7 @@ int wmain(int argc, wchar_t **argv)
     int have_cpu = 0; DWORD cpu_rate = 0;
     SIZE_T mem = 0, mem_total = 0;
     double io_mbps = 0;
+    double io_iops = 0;
     DWORD procs = 0;
     DWORD_PTR affinity = 0; int have_aff = 0;
     DWORD prio = 0; int have_prio = 0;
@@ -161,6 +163,10 @@ int wmain(int argc, wchar_t **argv)
         else if (!wcscmp(a, L"--io") && i + 1 < argc) {
             io_mbps = _wtof(argv[++i]);
             if (io_mbps <= 0) { fwprintf(stderr, L"[limit] --io 值无效: %ls\n", argv[i]); return 2; }
+        }
+        else if (!wcscmp(a, L"--iops") && i + 1 < argc) {
+            io_iops = _wtof(argv[++i]);
+            if (io_iops <= 0) { fwprintf(stderr, L"[limit] --iops 值无效: %ls\n", argv[i]); return 2; }
         }
         else if (!wcscmp(a, L"--procs") && i + 1 < argc) {
             procs = (DWORD)_wtoi(argv[++i]);
@@ -240,7 +246,7 @@ int wmain(int argc, wchar_t **argv)
         }
     }
 
-    if (io_mbps > 0) {
+    if (io_mbps > 0 || io_iops > 0) {
         FN_SET_IO_RATE pSet = (FN_SET_IO_RATE)
             GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetIoRateControlInformationJobObject");
         if (!pSet) {
@@ -249,12 +255,13 @@ int wmain(int argc, wchar_t **argv)
         }
         IO_RATE io; ZeroMemory(&io, sizeof(io));
         io.MaxBandwidth = (LONG64)(io_mbps * 1024.0 * 1024.0);
+        io.MaxIops = (LONG64)(io_iops + 0.5);
         io.ControlFlags = 1; /* JOB_OBJECT_IO_RATE_CONTROL_ENABLE */
         if (pSet(job, &io) == 0) {
             fwprintf(stderr, L"[limit] 设置 IO 限速失败: %lu\n", GetLastError());
             return 1;
         }
-        fwprintf(stderr, L"[limit] 注意: IO 限速对缓存写不保证(回写会爆发), 直写 IO 才精确生效\n");
+        fwprintf(stderr, L"[limit] 注意: IO 限速对缓存写不保证(回写会爆发), 直写/写穿透 IO 才精确生效\n");
     }
 
     /* ---- 挂起启动 -> 入 Job -> 恢复(避免开头几毫秒不受限) ---- */
@@ -282,6 +289,7 @@ int wmain(int argc, wchar_t **argv)
         if (mem)       off += _snwprintf(buf + off, (size_t)(512 - off), L" mem<=%.0fMB", mem / 1e6);
         if (mem_total) off += _snwprintf(buf + off, (size_t)(512 - off), L" mem_total<=%.0fMB", mem_total / 1e6);
         if (io_mbps)   off += _snwprintf(buf + off, (size_t)(512 - off), L" io<=%.0fMB/s", io_mbps);
+        if (io_iops)   off += _snwprintf(buf + off, (size_t)(512 - off), L" iops<=%.0f/s", io_iops);
         if (procs)     off += _snwprintf(buf + off, (size_t)(512 - off), L" procs<=%lu", procs);
         if (have_aff)  off += _snwprintf(buf + off, (size_t)(512 - off), L" affinity=%llx", (unsigned long long)affinity);
         if (have_prio) off += _snwprintf(buf + off, (size_t)(512 - off), L" prio=%lu", prio);
