@@ -1,21 +1,27 @@
 # limit
 
-**通用程序资源限制器 — Windows 上是 Job Object 版 cgroup**
+**通用程序资源限制器 — 进程树级 CPU / 内存 / 磁盘 IO / 进程数硬限制**
 
-[![Platform](https://img.shields.io/badge/platform-Windows%208%2B%20%7C%20Linux%20%7C%20macOS-0078D6?logo=windows95&logoColor=white)](#)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-0078D6)](#)
 [![Go](https://img.shields.io/badge/Go-stdlib%20only-00ADD8?logo=go&logoColor=white)](#)
 [![Deps](https://img.shields.io/badge/deps-0-brightgreen)](#)
-[![Admin](https://img.shields.io/badge/admin-not%20required-success)](#)
 
-`limit [选项] -- <命令> [参数...]` 把命令及其**所有子进程**整体关进一个 Job Object,
-像 Docker 一样限制 CPU / 内存 / 磁盘 IO / 进程数。Go 实现,零依赖单文件 exe,不需要管理员。
+`limit [选项] -- <命令> [参数...]` 把命令及其**所有子进程**整体关进一个资源容器,
+像 Docker 一样限制 CPU / 内存 / 磁盘 IO / 进程数。Go 实现,零依赖单文件二进制。
 
-Job Object 就是 Windows 原生的「进程组资源容器」——Windows 容器本身正是用它实现的,
-所以这不是山寨 Docker,而是用对了 Windows 自己的机制。
+发布件覆盖 **Windows / Linux / macOS** 全平台(amd64/arm64,见
+[Releases](https://github.com/Weidows/limit/releases))。
 
-**平台说明**:发布件覆盖 windows(amd64/arm64/386)、linux、macOS 全平台,但限制机制
-是 Windows Job Object——非 Windows 平台的二进制可以正常解析选项(`--help` 可用),
-执行时明确报错退出,不静默放行;linux 下等价能力是 cgroup v2,尚未移植。
+## 平台支持
+
+| 平台 | 状态 | 后端 |
+|---|---|---|
+| Windows | ✅ 全部选项可用,全部实测 | Job Object(Windows 原生进程组容器,Windows 容器本身就用它实现) |
+| Linux / macOS | ⚠️ 规划中 | cgroup v2 / rlimit(尚未移植) |
+
+非 Windows 平台的二进制可以正常解析选项、看 `--help`;真正执行到「施加限制」时
+**明确报错退出,不会静默放行**——不会让你误以为限制生效了。移植前,
+linux 下临时等价手段是 `systemd-run --scope -p CPUQuota=25% -- <命令>`。
 
 ## 快速上手
 
@@ -36,6 +42,8 @@ limit.exe --prio idle --cpu 10% -- ffmpeg -i in.mp4 out.mkv
 limit.exe --mem 1G --mem-total 4G -- some_tool.exe
 ```
 
+> 示例用 Windows 写法;选项语义全平台一致,可执行性见上方「平台支持」。
+
 ## 选项
 
 | 选项 | 说明 |
@@ -54,20 +62,20 @@ limit.exe --mem 1G --mem-total 4G -- some_tool.exe
 
 ## 安装
 
+从 [Releases](https://github.com/Weidows/limit/releases) 下载对应平台的压缩包,
+或源码构建(`CGO_ENABLED=0` 纯标准库,任意平台秒级编译):
+
 ```console
 go install github.com/Weidows/limit@latest
-:: 或源码构建(CGO_ENABLED=0,纯标准库)
-go build -o limit.exe .
+go build -o limit .
 ```
 
-GitHub Release 附带 CI 自动构建的全平台压缩包:windows amd64/arm64/386、
-linux amd64/arm64、macOS amd64/arm64(发布 release 时产出;非 Windows 件为明确报错的占位,见「平台说明」)。
+Windows 版要求 Win8+(IO 限速 API 需 Win8),免管理员。
 
-单文件 exe,Win8+(IO 限速 API 需 Win8),无需管理员。
-
-## 实测验证
+## 实测验证(Windows 后端)
 
 > i5-14600KF 14C/20T,Windows 11,2026-10。**全部数字实测,不抄文档。**
+> 选项语义按「全平台一致」设计;下表是 Windows 后端(Job Object)的落实情况。
 
 | 限制 | 测试 | 结果 |
 |---|---|---|
@@ -132,7 +140,9 @@ linux amd64/arm64、macOS amd64/arm64(发布 release 时产出;非 Windows 件�
 - `tests/` 下是三个 C 写的验证工具(burn=CPU 燃烧+自计时,alloc=逐 MB 分配,
   diotest=直写拷贝+计时)——验证工具与限制器语言无关,无需移植。
 
-## 做不到的(需要签名内核驱动)
+## Windows 后端的边界(需要签名内核驱动)
+
+> 非 Windows 后端(cgroup v2)没有这层限制;下表是 Job Object 路线的天花板。
 
 | 需求 | 为什么用户态做不到 |
 |---|---|

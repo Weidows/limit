@@ -1,9 +1,10 @@
 ---
 name: using-limit-cli
 description: >-
-  Run Windows commands inside a Job Object resource container with hard caps on
+  Run a command inside a resource container with hard caps on
   CPU, memory (commit), disk IO (bandwidth and IOPS), process count, CPU
-  affinity, and priority class, applied to the entire process tree. Use when an
+  affinity, and priority class, applied to the entire process tree. Backend is
+  Windows Job Object (linux/macOS builds report unsupported). Use when an
   agent needs to launch a heavy or rowdy command (archive extraction, bulk file
   copying, builds, checksums, runaway tools) without starving the rest of the
   machine — especially on HDDs, where many-small-file workloads collapse
@@ -14,30 +15,36 @@ user-invocable: true
 metadata: {"openclaw":{"emoji":"🛡️","os":["win32"]}}
 ---
 
-# using-limit-cli — limit.exe 使用技能
+# using-limit-cli — limit 使用技能
 
-`limit.exe [选项] -- <命令> [参数...]` 把命令及其**整棵子进程树**关进一个 Windows
-Job Object,硬限制 CPU / 内存 / 磁盘 IO / 进程数。零依赖单文件 exe(Win8+,免管理员)。
+`limit [选项] -- <命令> [参数...]` 把命令及其**整棵子进程树**关进一个资源容器,
+硬限制 CPU / 内存 / 磁盘 IO / 进程数。零依赖单文件二进制。
 agent 要跑重活(解压、批量拷贝、构建、校验)又不想拖垮整机时,一律套 limit。
+
+**平台**:发布件覆盖 Windows / Linux / macOS,但限制后端目前只有 Windows
+(Job Object,免管理员,Win8+);非 Windows 平台执行到施加限制那一步会明确报错退出,
+不静默放行。以下选项语义按全平台一致描述,机制细节以 Windows 后端实测为准。
 
 ## 0. 先确认可用
 
 ```bash
-# exe 在仓库根(gitignore 了,缺就现场构建;纯标准库,秒级)
-cd <limit 仓库根> && go build -o limit.exe .   # 若 limit.exe 不存在
-limit.exe --help
+# 二进制在仓库根或 Release 附件(缺就现场构建;纯标准库,秒级)
+cd <limit 仓库根> && go build -o limit .   # Windows 下产物为 limit.exe
+limit --help
 ```
 
 - 若报「IO 限速 API 不可用」→ 系统低于 Win8,`--io`/`--iops` 不可用,其余选项仍可用。
 - 若报「加入 Job 失败」→ 当前 shell 已在别的 Job/容器里(嵌套 Job 是 Windows 限制),
   换普通终端跑,不要静默放弃。
+- 若报「此平台不支持」→ 当前是 linux/macOS,cgroup 后端尚未移植;临时等价手段
+  `systemd-run --scope -p CPUQuota=25% -- <命令>`(linux),不要用 limit 假装限制。
 
 ## 1. 基本用法
 
 选项在前,`--` 之后是被限制的命令:
 
 ```bash
-limit.exe --cpu 25% --mem 2G --io 50 -- 7z x big.7z -oD:\out
+limit --cpu 25% --mem 2G --io 50 -- 7z x big.7z -oD:\out
 ```
 
 limit 会挂起启动子进程 → 入 Job → 恢复(开头几毫秒也不受限),默认 limit 被杀时
@@ -61,24 +68,24 @@ limit 会挂起启动子进程 → 入 Job → 恢复(开头几毫秒也不受�
 
 ```bash
 # 限速解压大压缩包(缓存写回写挡不住,见坑 #1;吃 CPU 的活套 --cpu 当节流阀)
-limit.exe --cpu 25% --mem 2G --io 50 -- 7z x big.7z -oD:\out
+limit --cpu 25% --mem 2G --io 50 -- 7z x big.7z -oD:\out
 
 # HDD 上批量小文件(拷贝/解压/建目录):带宽顶永远撞不上,伤盘的是随机寻道
 # → 用 IOPS 顶,60/s 左右既能干活又不卡机;元数据操作(create/close)也计数,一并管住
-limit.exe --iops 60 -- xcopy.exe S:\ D:\ /E
+limit --iops 60 -- xcopy.exe S:\ D:\ /E
 
 # 顺序大块拷贝:带宽顶管总量,IOPS 顶防小文件抖动,双保险
-limit.exe --io 80 --iops 100 -- robocopy S:\ D:\backup /E
+limit --io 80 --iops 100 -- robocopy S:\ D:\backup /E
 
 # 后台任务让路 + 限制核数
-limit.exe --prio idle --cpu 10% -- ffmpeg -i in.mp4 out.mkv
+limit --prio idle --cpu 10% -- ffmpeg -i in.mp4 out.mkv
 
 # 缓存写程序(7z 等)回写限不住?CPU 顶当 IO 节流阀,对所有 IO 类型生效:
 # 压缩解压吃 CPU,压住 CPU 即压住数据产出速率;HDD 上还能削平回写爆发
-limit.exe --cpu 5% -- 7z x big.7z -oHDD:\out
+limit --cpu 5% -- 7z x big.7z -oHDD:\out
 
 # 防失控工具吃爆内存(单进程 1G,整棵树 4G)
-limit.exe --mem 1G --mem-total 4G -- some_tool.exe
+limit --mem 1G --mem-total 4G -- some_tool.exe
 ```
 
 ## 4. 语义与坑(必读,全部实测结论)
