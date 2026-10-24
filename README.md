@@ -22,6 +22,9 @@ limit.exe --cpu 25% --mem 2G --io 50 -- 7z x big.7z -oD:\out
 :: HDD 上批量小文件拷贝/解压,用 IOPS 顶摁住寻道风暴(带宽顶管不住这种负载)
 limit.exe --iops 60 -- xcopy.exe S:\ D:\ /E
 
+:: 缓存写程序(7z 等)限不住回写?用 CPU 顶当 IO 节流阀——对所有 IO 都生效
+limit.exe --cpu 5% -- 7z x big.7z -oHDD:\out
+
 :: 后台转码给前台让路
 limit.exe --prio idle --cpu 10% -- ffmpeg -i in.mp4 out.mkv
 
@@ -52,6 +55,8 @@ go install github.com/Weidows/limit@latest
 :: 或源码构建(CGO_ENABLED=0,纯标准库)
 go build -o limit.exe .
 ```
+
+GitHub Release 附带自动构建的 amd64 / arm64 / 386 三档 Windows exe(发布 release 时 CI 产出)。
 
 单文件 exe,Win8+(IO 限速 API 需 Win8),无需管理员。
 
@@ -84,9 +89,19 @@ go build -o limit.exe .
    各跑 17.2s/20.2s(合计 ≈50MB/s);若按文档所说「每盘独立 50MB/s」则应各 ~10.2s。
    只对「无缓冲/写穿透」IO 精确生效——7z/Bandizip 这类默认缓存写的程序,
    进程退出后由系统 lazy writer 全速回写,**会逃过限制**
-   (实测磁盘仍 188MB/s 爆发 + 长尾)。解压/拷贝要稳定限速可用
-   [io7z](https://github.com/Weidows/io7z) 的分段节流方案(本地项目 lib/io7z,未推送 GitHub)。
+   (实测磁盘仍 188MB/s 爆发 + 长尾)。要按字节稳定限速可用
+   [io7z](https://github.com/Weidows/io7z) 的分段节流方案(本地项目 lib/io7z,未推送 GitHub);
+   不改工具就套 `--cpu` 当 IO 节流阀(见下一条)。
    *文档另称 VolumeName=NULL 时按盘独立、且 Win10 1607+ 不支持——均与实测不符,以实测为准。*
+3.5. **`--cpu` 是「全 IO 类型」的节流阀**:IO 限速 API 管不住缓存写,但 CPU 顶管得住
+   ——7z 解压是压缩算法吃 CPU 的活,CPU 被压住后产出数据的速率同步下降,缓存写、
+   直写、元数据全都被间接压住。实测两档(2GB 包):
+   小包(388MB 全进缓存):基线 1.57s → `10%` 1.80s → `5%` 2.46s → `2.5%` 7.96s,近似线性;
+   大包(解压 7.5GB 到 HDD):磁盘稳态本来就只有 4MB/s(5.7 万小文件的机械盘底盘),
+   此时吞吐压无可压,`--cpu` 的价值变成削峰——开头 61MB/s 的缓存回写爆发被 `5%`
+   削到 13MB/s、曲线全程平稳(机械盘少寻道、占用更可预期)。
+   经验:实际 IO 速率 ≈ min(磁盘自然速率, CPU 顶折算速率),给 7z 之类压缩解压
+   选 `--cpu` 档位即可粗调 IO 上限。
 4. **`--iops` 是小文件/HDD 场景的另一个维度**:顺序大块 IO 每次只算 1 个操作,
    要靠 `--io` 带宽顶管;而大批量小文件把 HDD 拖到远低于标称速度时,`--io` 永远撞不上,
    伤盘的是每秒成百上千次随机寻道——用 `--iops` 直接限操作数(读写合计)。
