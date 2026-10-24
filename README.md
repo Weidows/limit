@@ -81,17 +81,17 @@ Windows 版要求 Win8+(IO 限速 API 需 Win8),免管理员。
 
 | 限制 | 测试 | 结果 |
 |---|---|---|
-| `--cpu 5%` | 4 线程烧 10 秒 | CPU 10.55s ≈ 正好 1 核(5% × 20 逻辑 CPU)✅ |
-| `--cpu 10%` | 4 线程烧 6 秒 | CPU 11.14s ≈ 2 核 ✅ |
-| `--cpu 25%` | 4 线程烧 6 秒 | C/Go 交替 A/B 同分布(17.7–19.6 vs 18.1–18.9),与不限速基线无差异——5 核对 4 线程不触顶 ✅ |
-| `--mem 256M` | 分配 1024MB | ALLOC_FAILED at 254MB,错误码 1455 `ERROR_COMMITMENT_LIMIT` ✅ |
-| `--mem 512M --mem-total 700M` | 分配 1024MB | 510MB 处失败(单进程顶先触发)✅ |
-| `--io 50` | 直写拷贝 254MB | 10.07s(单向 26.5MB/s,读写合计 53MB/s ≈ 上限)✅ |
-| `--iops 100` | 300 次写穿透小 IO(4KB create+write+close) | 0.55s → 25.1s,压到 ≈100 IO 操作/s(create/close 元数据也计数)✅ |
-| `--io 100 --iops 100` | 同上 | API 接受双顶,IOPS 先撞顶生效 ✅ |
-| `--cpu/--io/--iops` × robocopy | 17000 文件/660MB 缓存写拷贝(见下方注意) | 基线 6.3s@112MB/s;`--cpu 25%` 9.6s@73MB/s;`--io 10` 11.8s@60MB/s;`--iops 100` 34.7s@27MB/s;`--iops 30` 92.9s@7.5MB/s——四类顶全部压得住,梯度与档位一致 ✅ |
-| `--affinity 0x1` | 2 线程烧 6 秒 | CPU 5.55s(绑 1 核)✅ |
-| `--procs 1` | cmd 里再起 cmd | 孙进程创建被拒,退出码 1 ✅ |
+| `--cpu` | burn 4 线程,5%/10%/25% 三档 | 5%≈1 核、10%≈2 核精确;上限高于线程需求时不触顶 ✅ |
+| `--mem` | alloc 分配 1024MB | 254MB 处分配失败,错误码 1455 `ERROR_COMMITMENT_LIMIT` ✅ |
+| `--io` | diotest 直写拷贝 | 读写合计精确压在档位上 ✅ |
+| `--iops` | diotest 写穿透小 IO | 压到 ≈100 操作/s,create/close 元数据也计数 ✅ |
+| `--affinity 0x1` | burn 2 线程 | CPU 5.55s(绑 1 核)✅ |
+| `--procs 1` | cmd 里再起 cmd | 孙进程创建被拒 ✅ |
+| × **7z** | 2GB 包解压 7.5GB 到 HDD | `--cpu` 当节流阀:小包线性减速;大包把 61MB/s 回写爆发削到 13MB/s ✅ |
+| × **robocopy** | 17000 文件/660MB 拷贝 | 四类顶全压得住:`--iops 30` 减速 15 倍;小数据量时 `--io`/`--iops` 无感(全进缓存)✅ |
+
+按程序归档的完整数据(负载、档位、耗时、曲线结论)在
+[docs/MEASURED.md](docs/MEASURED.md);每实测一个新程序就往那里追加一节。
 
 ## 语义要点(必读)
 
