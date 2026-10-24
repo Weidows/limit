@@ -81,7 +81,7 @@ limit.exe --mem 1G --mem-total 4G -- some_tool.exe
 
 1. **缓存写会逃逸**:`--io`/`--iops` 只对无缓冲/写穿透 IO 精确生效。7z/Bandizip
    等默认缓存写的程序,退出后系统 lazy writer 全速回写,限不住。
-   解压要稳定限速用 [io7z](https://github.com/Weidows/io7z) 的分段节流。
+   解压要稳定限速用 io7z 的分段节流(本地项目,与 limit 同级目录)。
 2. **`--io` 是整 Job 聚合口径,不是按盘独立**:Job 内多盘并行 IO 共享同一个配额
    (实测与文档不符,以实测为准)。
 3. **`--mem` 是 commit 口径**:RSS/工作集只有软限,Windows 语义如此,别承诺 RSS 硬顶。

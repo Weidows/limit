@@ -84,8 +84,8 @@ go build -o limit.exe .
    各跑 17.2s/20.2s(合计 ≈50MB/s);若按文档所说「每盘独立 50MB/s」则应各 ~10.2s。
    只对「无缓冲/写穿透」IO 精确生效——7z/Bandizip 这类默认缓存写的程序,
    进程退出后由系统 lazy writer 全速回写,**会逃过限制**
-   (实测磁盘仍 188MB/s 爆发 + 长尾)。解压/拷贝要稳定限速请用
-   [io7z](https://github.com/Weidows/io7z) 的分段节流方案。
+   (实测磁盘仍 188MB/s 爆发 + 长尾)。解压/拷贝要稳定限速可用
+   [io7z](https://github.com/Weidows/io7z) 的分段节流方案(本地项目 lib/io7z,未推送 GitHub)。
    *文档另称 VolumeName=NULL 时按盘独立、且 Win10 1607+ 不支持——均与实测不符,以实测为准。*
 4. **`--iops` 是小文件/HDD 场景的另一个维度**:顺序大块 IO 每次只算 1 个操作,
    要靠 `--io` 带宽顶管;而大批量小文件把 HDD 拖到远低于标称速度时,`--io` 永远撞不上,
@@ -125,5 +125,5 @@ CPU/内存/进程数在 Job Object(用户态可设,本文全部实测生效),网
 
 ## 相关
 
-- [io7z](https://github.com/Weidows/io7z) — 机械盘限速解压(IO 限速的可靠落地形态)
+- [io7z](https://github.com/Weidows/io7z) — 机械盘限速解压(IO 限速的可靠落地形态;本地项目 lib/io7z,未推送 GitHub)
 - `skills/using-limit-cli/SKILL.md` — agent 可直接引用的使用技能(选项语义 + 常用配方)
