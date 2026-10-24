@@ -7,7 +7,7 @@
 //
 // 边界(与 C 版一致, README 有详细说明):
 //   - --io 只对无缓冲/写穿透 IO 精确生效; 默认缓存写(7z 等)的回写会逃逸,
-//     磁盘仍会爆发。稳定限速请用 io7z: https://github.com/Weidows/io7z
+//     磁盘仍会爆发。缓存写场景可用 --cpu 顶当 IO 节流阀(见 README)。
 //   - --mem 是 commit(虚拟内存提交)口径硬顶; RSS 只有软限。
 //   - 网络带宽/统一磁盘 IO 需要签名内核驱动, 用户态做不到。
 package main

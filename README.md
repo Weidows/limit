@@ -89,9 +89,7 @@ GitHub Release 附带自动构建的 amd64 / arm64 / 386 三档 Windows exe(发�
    各跑 17.2s/20.2s(合计 ≈50MB/s);若按文档所说「每盘独立 50MB/s」则应各 ~10.2s。
    只对「无缓冲/写穿透」IO 精确生效——7z/Bandizip 这类默认缓存写的程序,
    进程退出后由系统 lazy writer 全速回写,**会逃过限制**
-   (实测磁盘仍 188MB/s 爆发 + 长尾)。要按字节稳定限速可用
-   [io7z](https://github.com/Weidows/io7z) 的分段节流方案(本地项目 lib/io7z,未推送 GitHub);
-   不改工具就套 `--cpu` 当 IO 节流阀(见下一条)。
+   (实测磁盘仍 188MB/s 爆发 + 长尾)。缓存写场景套 `--cpu` 当 IO 节流阀(见下一条)。
    *文档另称 VolumeName=NULL 时按盘独立、且 Win10 1607+ 不支持——均与实测不符,以实测为准。*
 3.5. **`--cpu` 是「全 IO 类型」的节流阀**:IO 限速 API 管不住缓存写,但 CPU 顶管得住
    ——7z 解压是压缩算法吃 CPU 的活,CPU 被压住后产出数据的速率同步下降,缓存写、
@@ -140,5 +138,4 @@ CPU/内存/进程数在 Job Object(用户态可设,本文全部实测生效),网
 
 ## 相关
 
-- [io7z](https://github.com/Weidows/io7z) — 机械盘限速解压(IO 限速的可靠落地形态;本地项目 lib/io7z,未推送 GitHub)
 - `skills/using-limit-cli/SKILL.md` — agent 可直接引用的使用技能(选项语义 + 常用配方)
