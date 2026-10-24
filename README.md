@@ -1,5 +1,7 @@
 # limit
 
+![limit — 通用程序资源限制器](docs/banner.png)
+
 **通用程序资源限制器 — 进程树级 CPU / 内存 / 磁盘 IO / 进程数硬限制**
 
 [![Platform](https://img.shields.io/badge/platform-Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-0078D6)](#)
