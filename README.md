@@ -9,9 +9,6 @@
 `limit [选项] -- <命令> [参数...]` 把命令及其**所有子进程**整体关进一个资源容器,
 像 Docker 一样限制 CPU / 内存 / 磁盘 IO / 进程数。Go 实现,零依赖单文件二进制。
 
-发布件覆盖 **Windows / Linux / macOS** 全平台(amd64/arm64,见
-[Releases](https://github.com/Weidows/limit/releases))。
-
 ## 平台支持
 
 | 平台 | 状态 | 后端 |
@@ -67,9 +64,6 @@ go build -o limit .
 
 ## 实测验证(Windows 后端)
 
-> i5-14600KF 14C/20T,Windows 11,2026-10。**全部数字实测,不抄文档。**
-> 选项语义按「全平台一致」设计;下表是 Windows 后端(Job Object)的落实情况。
-
 | 限制 | 测试 | 结果 |
 |---|---|---|
 | `--cpu` | burn 4 线程,5%/10%/25% 三档 | 5%≈1 核、10%≈2 核精确;上限高于线程需求时不触顶 ✅ |
@@ -80,6 +74,10 @@ go build -o limit .
 | `--procs 1` | cmd 里再起 cmd | 孙进程创建被拒 ✅ |
 | × **7z** | 2GB 包解压 7.5GB 到 HDD | `--cpu` 当节流阀:小包线性减速;大包把 61MB/s 回写爆发削到 13MB/s ✅ |
 | × **robocopy** | 17000 文件/660MB 拷贝 | 四类顶全压得住:`--iops 30` 减速 15 倍;小数据量时 `--io`/`--iops` 无感(全进缓存)✅ |
+
+实际压制IO后的效果图:
+
+![1792912155368](image/README/1792912155368.png)
 
 按程序归档的完整数据(负载、档位、耗时、曲线结论)在
 [docs/MEASURED.md](docs/MEASURED.md);每实测一个新程序就往那里追加一节。
