@@ -130,7 +130,7 @@ static void usage(const wchar_t *me)
     fwprintf(stderr, L"  --prio <级别>       idle|below|normal|above|high\n");
     fwprintf(stderr, L"  --no-kill-on-close  limit 被杀时不让子进程陪葬(默认陪葬)\n");
     fwprintf(stderr, L"\n示例: %ls --cpu 25%% --mem 2G -- 7z x big.7z -oD:\\out\n", me);
-    fwprintf(stderr, L"      %ls --io 50 -- xcopy.exe S:\\ D:\\ /E\n", me);
+    fwprintf(stderr, L"      %ls --io 50 -- robocopy S:\\ D:\\ /E /J\n", me);
 }
 
 /* ---------------- main ---------------- */

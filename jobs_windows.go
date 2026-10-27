@@ -10,8 +10,13 @@ package main
 import (
 	"fmt"
 	"math"
+	"os"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -29,16 +34,19 @@ var (
 	procGetExitCodeProcess        = kernel32.NewProc("GetExitCodeProcess")
 	procSetPriorityClass          = kernel32.NewProc("SetPriorityClass")
 	procCloseHandle               = kernel32.NewProc("CloseHandle")
+	procOpenProcess               = kernel32.NewProc("OpenProcess")
+	procGetProcessIoCounters      = kernel32.NewProc("GetProcessIoCounters")
 
 	// Job Object I/O rate control: 运行时解析, Win7 及更早不存在
 	procSetIoRateControlInformationJobObject = kernel32.NewProc("SetIoRateControlInformationJobObject")
 )
 
-// JobObjectInformationClass(用到的三个; 不能与结构体同名, Go 单命名空间)
+// JobObjectInformationClass(用到的; 不能与结构体同名, Go 单命名空间)
 const (
-	jobObjectInfoClassBasicAccounting = 1
-	jobObjectInfoClassExtendedLimit   = 9
-	jobObjectInfoClassCpuRateControl  = 15
+	jobObjectInfoClassBasicAccounting    = 1
+	jobObjectInfoClassBasicProcessIdList = 3
+	jobObjectInfoClassExtendedLimit      = 9
+	jobObjectInfoClassCpuRateControl     = 15
 )
 
 // 限制位与开关
@@ -61,11 +69,11 @@ const (
 
 // 优先级类
 const (
-	idlePriorityClass         = 0x00000040
-	belowNormalPriorityClass  = 0x00004000
-	normalPriorityClass       = 0x00000020
-	aboveNormalPriorityClass  = 0x00008000
-	highPriorityClass         = 0x00000080
+	idlePriorityClass        = 0x00000040
+	belowNormalPriorityClass = 0x00004000
+	normalPriorityClass      = 0x00000020
+	aboveNormalPriorityClass = 0x00008000
+	highPriorityClass        = 0x00000080
 )
 
 // ---------- 结构体(布局与 Win32 SDK 一致, 由 jobs_test.go 断言) ----------
@@ -83,12 +91,12 @@ type jobObjectBasicLimitInformation struct {
 }
 
 type ioCounters struct {
-	ReadOperationCount      uint64
-	WriteOperationCount     uint64
-	OtherOperationCount     uint64
-	ReadTransferCount       uint64
-	WriteTransferCount      uint64
-	OtherTransferCount      uint64
+	ReadOperationCount  uint64
+	WriteOperationCount uint64
+	OtherOperationCount uint64
+	ReadTransferCount   uint64
+	WriteTransferCount  uint64
+	OtherTransferCount  uint64
 }
 
 type jobObjectExtendedLimitInformation struct {
@@ -155,6 +163,19 @@ type processInformation struct {
 	DwThreadId  uint32
 }
 
+type processEntry32 struct {
+	Size            uint32
+	CntUsage        uint32
+	ProcessID       uint32
+	DefaultHeapID   uintptr
+	ModuleID        uint32
+	CntThreads      uint32
+	ParentProcessID uint32
+	PriClassBase    int32
+	Flags           uint32
+	ExeFile         [260]uint16
+}
+
 // ---------- Win32 封装 ----------
 
 func createJobObject() (syscall.Handle, error) {
@@ -199,13 +220,13 @@ func createProcessSuspended(cmdline string) (*processInformation, error) {
 		return nil, err
 	}
 	r1, _, callErr := procCreateProcessW.Call(
-		0,                                     // lpApplicationName
-		uintptr(unsafe.Pointer(p)),            // lpCommandLine(可写)
-		0, 0, 0,                               // 安全属性/继承
-		createSuspended,                       // 挂起创建
-		0, 0,                                  // 环境/工作目录
-		uintptr(unsafe.Pointer(&si)),          // STARTUPINFO
-		uintptr(unsafe.Pointer(&pi)),          // PROCESS_INFORMATION
+		0,                          // lpApplicationName
+		uintptr(unsafe.Pointer(p)), // lpCommandLine(可写)
+		0, 0, 0,                    // 安全属性/继承
+		createSuspended, // 挂起创建
+		0, 0,            // 环境/工作目录
+		uintptr(unsafe.Pointer(&si)), // STARTUPINFO
+		uintptr(unsafe.Pointer(&pi)), // PROCESS_INFORMATION
 	)
 	if r1 == 0 {
 		return nil, callErr
@@ -280,6 +301,461 @@ func setIoRateControl(job syscall.Handle, maxBandwidthBytes, maxIops int64) erro
 		return callErr
 	}
 	return nil
+}
+
+// ---------- 寻道频率限制(seek rate) ----------
+//
+// 目标只有一个: 保护 HDD 磁头。设备层 `Disk Transfers/sec` 是寻道频率的可用代理:
+//
+//	顺序 1MB : 1MB 只算 1 次事务(100MB/s ≈ 100 事务/s, 几乎不寻道)
+//	随机 4KB : 每 4KB 就是 1 次寻道, 同样字节量的事务数是顺序的 256 倍
+//
+// 所以「限 事务/s」天然对大文件松、对小文件狠: 吞吐天花板 ≈ 目标 × 平均 IO 大小。
+//
+// 实现要点:
+//  1. PDH 读 `\PhysicalDisk(*)\Disk Transfers/sec` 的**原始累积值**(免管理员),
+//     并按物理盘实例名匹配盘符; C:/D: 落在同一块物理盘时只算一次, 不重复计数。
+//  2. 每块盘独立记账, **任意一盘超目标**就冻结整棵进程树 —— 这就是
+//     「src / dst 谁超标谁触发」的语义, 不需要用户手工指定哪盘是瓶颈。
+//  3. 细粒度还债: 20ms 采样, 超额就按 欠账/目标 的时长分块冻结(5ms..250ms),
+//     每冻完一块立刻复采样。可达任意占空比 —— 旧实现「单 tick 最多冻 90% + 100ms
+//     采样」把地板钉死在 1/10 削减(目标 50 实测只能压到 735/s)。
+//  4. 冻结用缓存的进程句柄(300ms 刷新), 不再每次冻结/恢复都全量枚举进程表。
+//
+// 已知边界:
+//   - 计数器是**整盘**口径: 同盘其他程序也计入。背景负载本身高于目标时, 本程序会被
+//     自己的控制律饿住(占空比拉满, 打印一次告警) —— 语义上仍是「保整盘交互」。
+//   - 冻结作用于整棵树、不分盘: 一盘超标时另一盘的 IO 也一起停(占空比式限流必然会这样)。
+//   - 逐 IO 偏移量判定(真寻道)要 ETW Kernel-File, 需管理员, 故不采用。
+const (
+	th32csSnapProcess    = 0x00000002
+	processQueryInfo     = 0x0400 // IsProcessInJob 需要 QUERY_INFORMATION
+	processSuspendResume = 0x0800
+
+	seekTick       = 20 * time.Millisecond  // 采样周期
+	seekChunkMin   = 5 * time.Millisecond   // 单次冻结下限
+	seekChunkMax   = 250 * time.Millisecond // 单次冻结上限
+	seekTickBudget = 900 * time.Millisecond // 单个采样周期内最多冻结多久
+	seekDebtCap    = 2.0                    // 欠账上限(目标×秒), 防止长期冻死
+	seekPidRefresh = 300 * time.Millisecond // 刷新 Job 内进程句柄的间隔
+)
+
+var (
+	procCreateToolhelp32Snapshot = kernel32.NewProc("CreateToolhelp32Snapshot")
+	procProcess32FirstW          = kernel32.NewProc("Process32FirstW")
+	procProcess32NextW           = kernel32.NewProc("Process32NextW")
+	procIsProcessInJob           = kernel32.NewProc("IsProcessInJob")
+
+	ntdll                = syscall.NewLazyDLL("ntdll.dll")
+	procNtSuspendProcess = ntdll.NewProc("NtSuspendProcess")
+	procNtResumeProcess  = ntdll.NewProc("NtResumeProcess")
+
+	pdhDLL              = syscall.NewLazyDLL("pdh.dll")
+	procPdhOpenQuery    = pdhDLL.NewProc("PdhOpenQueryW")
+	procPdhAddCounter   = pdhDLL.NewProc("PdhAddEnglishCounterW")
+	procPdhCollectQuery = pdhDLL.NewProc("PdhCollectQueryData")
+	procPdhGetRawArray  = pdhDLL.NewProc("PdhGetRawCounterArrayW")
+	procPdhCloseQuery   = pdhDLL.NewProc("PdhCloseQuery")
+)
+
+// PDH_RAW_COUNTER
+type pdhRawCounter struct {
+	CStatus     uint32
+	TimeStamp   int64
+	FirstValue  int64 // 累积计数
+	SecondValue int64
+	MultiCount  uint32
+	_           uint32
+}
+
+// PDH_RAW_COUNTER_ITEM_W: 通配符计数器会用数组返回每个实例(物理盘)的值
+type pdhRawCounterItem struct {
+	Name *uint16
+	Raw  pdhRawCounter
+}
+
+// seekWatch 一块被监控的物理盘(设备层实例), name 形如 "1 D:" / "2 E: F:"。
+type seekWatch struct {
+	name    string
+	prev    uint64  // 上次读到的累积事务数
+	debt    float64 // 欠账(事务数), 只记正超额
+	total   float64 // 全程观测到的事务数
+	max     float64 // 峰值速率
+	samples int
+}
+
+// seekLimiter 监视若干物理盘, 任一盘设备层事务速率超目标就压整棵进程树。
+type seekLimiter struct {
+	job     syscall.Handle
+	target  float64
+	query   uintptr
+	count   uintptr
+	letters []string // 用户指定的盘符小写(或 "all")
+	watches []*seekWatch
+	frz     *freezer
+
+	start       time.Time
+	frozenTotal time.Duration
+	warned      bool
+	warnMu      sync.Mutex
+
+	stopCh chan struct{}
+	done   chan struct{}
+}
+
+// seekReport 结束时的实测数据(整盘口径: 同盘其他程序也计入)。
+type seekReport struct {
+	elapsed float64
+	frozen  float64
+	rows    []seekRow
+}
+
+type seekRow struct {
+	name string
+	avg  float64
+	max  float64
+	ops  float64
+}
+
+// freezer 缓存 Job 内进程句柄, 冻结/恢复只做 NtSuspendProcess/NtResumeProcess。
+// 旧实现对每次冻结/恢复都做一次全进程表快照 + IsProcessInJob, 100 轮/秒时开销爆炸,
+// 这也是当初不敢把采样周期调细的原因之一。
+type freezer struct {
+	job         syscall.Handle
+	handles     []syscall.Handle
+	lastRefresh time.Time
+	frozen      bool
+}
+
+func newFreezer(job syscall.Handle) *freezer {
+	f := &freezer{job: job}
+	f.refresh()
+	return f
+}
+
+func (f *freezer) refresh() {
+	for _, h := range f.handles {
+		closeHandle(h)
+	}
+	f.handles = f.handles[:0]
+	for _, pid := range pidsInJob(f.job) {
+		h, _, _ := procOpenProcess.Call(processSuspendResume, 0, uintptr(pid))
+		if h != 0 {
+			f.handles = append(f.handles, syscall.Handle(h))
+		}
+	}
+	f.lastRefresh = time.Now()
+}
+
+func (f *freezer) set(on bool) {
+	if on == f.frozen {
+		return
+	}
+	if len(f.handles) == 0 || time.Since(f.lastRefresh) > seekPidRefresh {
+		f.refresh()
+	}
+	for _, h := range f.handles {
+		if on {
+			procNtSuspendProcess.Call(uintptr(h))
+		} else {
+			procNtResumeProcess.Call(uintptr(h))
+		}
+	}
+	f.frozen = on
+}
+
+func (f *freezer) close() {
+	f.set(false)
+	for _, h := range f.handles {
+		closeHandle(h)
+	}
+	f.handles = nil
+}
+
+// utf16PtrToString 读 PDH 缓冲区里的实例名(不保证以固定长度结尾)。
+func utf16PtrToString(p *uint16) string {
+	if p == nil {
+		return ""
+	}
+	n := 0
+	for ptr := unsafe.Pointer(p); *(*uint16)(ptr) != 0; ptr = unsafe.Add(ptr, 2) {
+		n++
+	}
+	return syscall.UTF16ToString(unsafe.Slice(p, n))
+}
+
+// newSeekLimiter 建立 PDH 查询并解析出要监控的物理盘实例。
+func newSeekLimiter(job syscall.Handle, target float64, letters []string) (*seekLimiter, error) {
+	if err := procPdhGetRawArray.Find(); err != nil {
+		return nil, fmt.Errorf("PDH 数组接口不可用: %w", err)
+	}
+	for _, l := range letters {
+		if l == "all" {
+			continue
+		}
+		// PDH 通配符路径对不存在的盘不报错、只会一直返回 0(限速静默失效) —— 先拦下
+		if _, e := os.Stat(l + ":\\"); e != nil {
+			return nil, fmt.Errorf("盘 %s: 不存在或不可访问", l)
+		}
+	}
+	s := &seekLimiter{
+		job:     job,
+		target:  target,
+		letters: letters,
+		stopCh:  make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	var q uintptr
+	if r, _, _ := procPdhOpenQuery.Call(0, 0, uintptr(unsafe.Pointer(&q))); r != 0 {
+		return nil, fmt.Errorf("PdhOpenQuery 失败 (0x%x)", uint32(r))
+	}
+	s.query = q
+	path := `\PhysicalDisk(*)\Disk Transfers/sec`
+	p16, e := syscall.UTF16PtrFromString(path)
+	if e != nil {
+		procPdhCloseQuery.Call(q)
+		return nil, e
+	}
+	var c uintptr
+	if r, _, _ := procPdhAddCounter.Call(q, uintptr(unsafe.Pointer(p16)), 0, uintptr(unsafe.Pointer(&c))); r != 0 {
+		procPdhCloseQuery.Call(q)
+		return nil, fmt.Errorf("找不到 PhysicalDisk 计数器 (0x%x)", uint32(r))
+	}
+	s.count = c
+	procPdhCollectQuery.Call(q) // 建基线
+	if err := s.resolve(); err != nil {
+		procPdhCloseQuery.Call(q)
+		return nil, err
+	}
+	return s, nil
+}
+
+// readAll 读全部物理盘实例的累积事务数。
+func (s *seekLimiter) readAll() (map[string]uint64, bool) {
+	if r, _, _ := procPdhCollectQuery.Call(s.query); r != 0 {
+		return nil, false
+	}
+	var size, count uint32
+	procPdhGetRawArray.Call(s.count,
+		uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)), 0)
+	if size == 0 || count == 0 {
+		return nil, false
+	}
+	buf := make([]byte, size)
+	if r, _, _ := procPdhGetRawArray.Call(s.count,
+		uintptr(unsafe.Pointer(&size)), uintptr(unsafe.Pointer(&count)),
+		uintptr(unsafe.Pointer(&buf[0]))); r != 0 {
+		return nil, false
+	}
+	out := make(map[string]uint64, count)
+	items := unsafe.Slice((*pdhRawCounterItem)(unsafe.Pointer(&buf[0])), int(count))
+	for i := range items {
+		if items[i].Raw.CStatus != 0 {
+			continue
+		}
+		out[utf16PtrToString(items[i].Name)] = uint64(items[i].Raw.FirstValue)
+	}
+	runtime.KeepAlive(buf)
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+// resolve 把盘符映射成物理盘实例; 同一物理盘被多个盘符命中只登记一次。
+func (s *seekLimiter) resolve() error {
+	cur, ok := s.readAll()
+	if !ok {
+		return fmt.Errorf("读不到 PhysicalDisk 计数器")
+	}
+	names := make([]string, 0, len(cur))
+	for n := range cur {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	seen := make(map[string]bool, len(names))
+	for _, want := range s.letters {
+		hit := 0
+		for _, n := range names {
+			if n == "_Total" || !strings.Contains(n, ":") {
+				continue // 无盘符的设备(如 Optane 缓存盘)不参与
+			}
+			if want != "all" && !strings.Contains(strings.ToLower(n), " "+want+":") {
+				continue
+			}
+			hit++
+			if seen[n] {
+				continue
+			}
+			seen[n] = true
+			s.watches = append(s.watches, &seekWatch{name: n})
+		}
+		if hit == 0 {
+			return fmt.Errorf("盘 %s: 找不到设备层 IO 计数器(该盘可能不是固定磁盘)", want)
+		}
+	}
+	return nil
+}
+
+// run 在子进程存活期间持续限速; 返回的 stop 给出实测数据。
+func (s *seekLimiter) run() func() *seekReport {
+	s.frz = newFreezer(s.job)
+	s.start = time.Now()
+	go func() {
+		defer close(s.done)
+		prev, ok := s.readAll()
+		if !ok {
+			return
+		}
+		for _, w := range s.watches {
+			w.prev = prev[w.name]
+		}
+		prevT := time.Now()
+		tickStart := prevT
+		var frozenInTick time.Duration
+		for {
+			select {
+			case <-s.stopCh:
+				s.frz.set(false)
+				return
+			default:
+			}
+			cur, ok := s.readAll()
+			now := time.Now()
+			dt := now.Sub(prevT).Seconds()
+			if !ok || dt < 0.001 {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			prevT = now
+			worst := 0.0
+			for _, w := range s.watches {
+				c, has := cur[w.name]
+				if !has {
+					continue
+				}
+				if c < w.prev { // 计数器重置/回绕: 重设基线
+					w.prev = c
+					continue
+				}
+				delta := float64(c - w.prev)
+				w.prev = c
+				rate := delta / dt
+				w.total += delta
+				w.samples++
+				if rate > w.max {
+					w.max = rate
+				}
+				w.debt += delta - s.target*dt
+				if w.debt < 0 {
+					w.debt = 0
+				} else if cap := s.target * seekDebtCap; w.debt > cap {
+					w.debt = cap
+				}
+				if t := w.debt / s.target; t > worst {
+					worst = t
+				}
+			}
+			if worst < 0.003 {
+				// 达标: 补满本次采样周期, 让目标进程全速跑
+				if r := seekTick - time.Since(tickStart); r > 0 {
+					time.Sleep(r)
+				}
+				tickStart, frozenInTick = time.Now(), 0
+				continue
+			}
+			// 还债: 按 need = 欠账/目标 冻结, 分块(5ms..250ms), 冻完立刻复采样
+			frz := time.Duration(worst * float64(time.Second))
+			if frz < seekChunkMin {
+				frz = seekChunkMin
+			}
+			if frz > seekChunkMax {
+				frz = seekChunkMax
+			}
+			if left := seekTickBudget - frozenInTick; frz > left {
+				frz = left
+			}
+			if frz <= 0 {
+				// 本周期冻结预算用尽: 让出去一小会再继续, 并只告警一次
+				s.warnOnce()
+				if r := seekTick - time.Since(tickStart); r > 0 {
+					time.Sleep(r)
+				}
+				tickStart, frozenInTick = time.Now(), 0
+				continue
+			}
+			s.frz.set(true)
+			time.Sleep(frz)
+			s.frz.set(false)
+			frozenInTick += frz
+			s.frozenTotal += frz
+		}
+	}()
+	return func() *seekReport {
+		close(s.stopCh)
+		<-s.done
+		s.frz.close()
+		el := time.Since(s.start).Seconds()
+		if el <= 0 {
+			el = 1e-9
+		}
+		rep := &seekReport{elapsed: el, frozen: s.frozenTotal.Seconds() / el}
+		for _, w := range s.watches {
+			rep.rows = append(rep.rows, seekRow{
+				name: w.name,
+				avg:  w.total / el,
+				max:  w.max,
+				ops:  w.total,
+			})
+		}
+		return rep
+	}
+}
+
+func (s *seekLimiter) warnOnce() {
+	s.warnMu.Lock()
+	defer s.warnMu.Unlock()
+	if s.warned {
+		return
+	}
+	s.warned = true
+	eprintf("[limit] 警告: 冻结占空比已拉满仍压不住 —— 整盘其他程序的 IO 高于目标 %.0f/s, "+
+		"或目标设得过低; 已保持最大压制继续运行\n", s.target)
+}
+
+// describe 供启动摘要行使用, 形如 "seeks<=50/s@d: e:" / "seeks<=50/s@all"。
+func (s *seekLimiter) describe() string {
+	parts := make([]string, 0, len(s.watches))
+	for _, w := range s.watches {
+		parts = append(parts, strings.ToLower(w.name))
+	}
+	return fmt.Sprintf("seeks<=%.0f/s@[%s]", s.target, strings.Join(parts, ", "))
+}
+
+// pidsInJob 枚举 Job 内全部进程(含孙进程)。
+func pidsInJob(job syscall.Handle) []uint32 {
+	snap, _, _ := procCreateToolhelp32Snapshot.Call(th32csSnapProcess, 0)
+	if snap == 0 || snap == uintptr(syscall.InvalidHandle) {
+		return nil
+	}
+	defer closeHandle(syscall.Handle(snap))
+	var e processEntry32
+	e.Size = uint32(unsafe.Sizeof(e))
+	var out []uint32
+	r, _, _ := procProcess32FirstW.Call(snap, uintptr(unsafe.Pointer(&e)))
+	for r != 0 {
+		// IsProcessInJob 用 QUERY_LIMITED 会 access denied 而漏掉进程, 必须 QUERY_INFORMATION
+		h, _, _ := procOpenProcess.Call(processQueryInfo, 0, uintptr(e.ProcessID))
+		if h != 0 {
+			var in int32
+			if ok, _, _ := procIsProcessInJob.Call(h, uintptr(job), uintptr(unsafe.Pointer(&in))); ok != 0 && in != 0 {
+				out = append(out, e.ProcessID)
+			}
+			closeHandle(syscall.Handle(h))
+		}
+		r, _, _ = procProcess32NextW.Call(snap, uintptr(unsafe.Pointer(&e)))
+	}
+	return out
 }
 
 // ---------- 执行(仅 Windows) ----------
@@ -362,7 +838,7 @@ func runWindows(L *limits, cmdArgs []string) int {
 			eprintf("[limit] 设置 IO 限速失败: %v\n", err)
 			return 1
 		}
-		eprintf("[limit] 注意: IO 限速对缓存写不保证(回写会爆发), 直写/写穿透 IO 才精确生效\n")
+		eprintf("[limit] 注意: IO 限速只对无缓冲/直写精确生效; 缓冲写(robocopy/xcopy 默认)会穿透, robocopy 加 /J 可解\n")
 	}
 
 	// ---- 挂起启动 -> 入 Job -> 恢复 ----
@@ -385,6 +861,20 @@ func runWindows(L *limits, cmdArgs []string) int {
 		eprintf("[limit] 恢复子进程失败: %v\n", err)
 	}
 
+	// --seeks: 启动设备层寻道频率限制(多物理盘 + 细粒度占空比冻结)
+	var stopSeek func() *seekReport
+	var seekLim *seekLimiter
+	if L.haveSeeks {
+		lim, err := newSeekLimiter(job, L.seeks, L.seekLetters)
+		if err != nil {
+			eprintf("[limit] --seeks 初始化失败: %v\n", err)
+			return 1
+		}
+		defer procPdhCloseQuery.Call(lim.query)
+		seekLim = lim
+		stopSeek = lim.run()
+	}
+
 	// ---- 摘要行 ----
 	summary := fmt.Sprintf("[limit] 运行中 (pid %d):", pi.DwProcessId)
 	if L.haveCPU {
@@ -402,6 +892,9 @@ func runWindows(L *limits, cmdArgs []string) int {
 	if L.ioIops > 0 {
 		summary += fmt.Sprintf(" iops<=%.0f/s", L.ioIops)
 	}
+	if seekLim != nil {
+		summary += " " + seekLim.describe()
+	}
 	if L.procs != 0 {
 		summary += fmt.Sprintf(" procs<=%d", L.procs)
 	}
@@ -415,6 +908,15 @@ func runWindows(L *limits, cmdArgs []string) int {
 
 	if err := waitForSingleObject(pi.HProcess); err != nil {
 		eprintf("[limit] 等待子进程失败: %v\n", err)
+	}
+	if stopSeek != nil {
+		rep := stopSeek()
+		eprintf("[limit] seeks 目标 %.0f/s | 设备层实测(整盘口径):\n", L.seeks)
+		for _, r := range rep.rows {
+			eprintf("[limit]   %-12s 均值 %.0f/s  峰值 %.0f/s  (共 %.0f 事务)\n",
+				strings.ToLower(r.name), r.avg, r.max, r.ops)
+		}
+		eprintf("[limit]   冻结占空比 %.1f%% | 运行 %.1fs\n", rep.frozen*100, rep.elapsed)
 	}
 	code, err := getExitCodeProcess(pi.HProcess)
 	if err != nil {

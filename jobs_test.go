@@ -100,8 +100,8 @@ func TestParseCPU(t *testing.T) {
 		{"25", 2500, true},
 		{"2.5%", 250, true},
 		{"100%", 10000, true},
-		{"0.005%", 1, true},    // 0.5 四舍五入到 1(=0.01% API 下限), 与 C 版 (DWORD)(x+0.5) 一致
-		{"0.001%", 0, false},   // 0.1 舍入后为 0, 低于下限
+		{"0.005%", 1, true},  // 0.5 四舍五入到 1(=0.01% API 下限), 与 C 版 (DWORD)(x+0.5) 一致
+		{"0.001%", 0, false}, // 0.1 舍入后为 0, 低于下限
 		{"150%", 0, false},
 		{"abc", 0, false},
 		{"", 0, false},
@@ -135,6 +135,36 @@ func TestParseAffinity(t *testing.T) {
 		got, ok := parseAffinity(c.in)
 		if ok != c.ok || (ok && got != c.want) {
 			t.Errorf("parseAffinity(%q) = (%#x, %v), want (%#x, %v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestParseDriveList(t *testing.T) {
+	cases := []struct {
+		args []string
+		want []string
+		n    int
+	}{
+		{[]string{"D:"}, []string{"d"}, 1},
+		{[]string{"D:", "E:"}, []string{"d", "e"}, 2},
+		{[]string{"c", "f:"}, []string{"c", "f"}, 2},
+		{[]string{"all"}, []string{"all"}, 1},
+		{[]string{"ALL", "D:"}, []string{"all", "d"}, 2},
+		{[]string{"D:", "--", "robocopy"}, []string{"d"}, 1}, // 遇到 -- 停
+		{[]string{"D:", "x"}, []string{"d", "x"}, 2},         // 单字母也算盘符(命令名一般不会只有一个字母)
+		{[]string{"robocopy"}, nil, 0},                       // 根本不是盘符
+		{[]string{""}, nil, 0},
+	}
+	for _, c := range cases {
+		got, n := parseDriveList(c.args)
+		if n != c.n || len(got) != len(c.want) {
+			t.Errorf("parseDriveList(%q) = (%q, %d), want (%q, %d)", c.args, got, n, c.want, c.n)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("parseDriveList(%q)[%d] = %q, want %q", c.args, i, got[i], c.want[i])
+			}
 		}
 	}
 }

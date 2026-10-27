@@ -2,7 +2,7 @@
 //
 // 用法:
 //
-//	limit [--cpu 25%] [--mem 512M] [--io 50MB/s] [--iops 100] [--procs 8]
+//	limit [--cpu 25%] [--mem 512M] [--io 50MB/s] [--seeks 200 D: E:] [--procs 8]
 //	      [--affinity 0,2-5] [--prio below] [--no-kill-on-close] -- 7z x a.7z -oout\
 //
 // 平台: 限制机制是 Windows Job Object(整棵进程树生效)。本程序也提供
@@ -14,6 +14,9 @@
 //     磁盘仍会爆发。缓存写场景可用 --cpu 顶当 IO 节流阀(见 README)。
 //   - --mem 是 commit(虚拟内存提交)口径硬顶; RSS 只有软限。
 //   - 网络带宽/统一磁盘 IO 需要签名内核驱动, 用户态做不到。
+//   - --seeks 面向 HDD 保护磁头: 限的是「整盘设备层事务数/秒」(其他程序也计入),
+//     大文件事务少几乎不受影响, 大量小文件被削得最狠。冻结不分盘: 任一盘超标时
+//     整棵树(含另一盘的 IO)一起停。目标值按「能接受的顺序吞吐 ÷ 平均 IO 大小」倒推。
 package main
 
 import (
@@ -31,6 +34,9 @@ type limits struct {
 	memTotal    uintptr
 	ioMBps      float64
 	ioIops      float64
+	seeks       float64
+	haveSeeks   bool
+	seekLetters []string // 盘符(小写)或 "all"
 	procs       uint32
 	affinity    uintptr
 	haveAff     bool
@@ -121,6 +127,28 @@ func parseAffinity(s string) (uintptr, bool) {
 	return mask, true
 }
 
+// parseDriveList 吃掉参数流里连续的盘符 token(形如 D: / D / all), 返回小写盘符和消耗个数。
+// 多盘监控靠它: --seeks 100 D: E: 表示「任一盘超 100 事务/s 就压」。
+func parseDriveList(args []string) ([]string, int) {
+	var out []string
+	n := 0
+	for _, a := range args {
+		t := strings.TrimSpace(a)
+		if strings.EqualFold(t, "all") {
+			out = append(out, "all")
+			n++
+			continue
+		}
+		d := strings.TrimSuffix(t, ":")
+		if len(d) != 1 || !((d[0] >= 'a' && d[0] <= 'z') || (d[0] >= 'A' && d[0] <= 'Z')) {
+			break
+		}
+		out = append(out, strings.ToLower(d))
+		n++
+	}
+	return out, n
+}
+
 func quoteArg(a string) string {
 	if !strings.ContainsAny(a, " \t\"") {
 		return a
@@ -144,15 +172,21 @@ func usage(me string) {
 	eprintf("  --cpu <百分比>      CPU 硬顶, 如 25%% (1%%..100%%, 相对整机算力)\n")
 	eprintf("  --mem <大小>        单进程 commit 内存硬顶, 如 512M / 4G\n")
 	eprintf("  --mem-total <大小>  整棵树 commit 内存硬顶\n")
-	eprintf("  --io <MB/s>         磁盘 IO 速率(读写合计; 直写精确, 缓存写不保证)\n")
-	eprintf("  --iops <次数/s>     IO 每秒操作数上限(读写合计; 可与 --io 并用, 谁先撞顶谁生效)\n")
-	eprintf("                      小文件场景 HDD 掉速时用它: 顺序大块走 --io, 随机小 IO 撞 --iops\n")
+	eprintf("  --io <MB/s>         磁盘 IO 速率(读写合计; 无缓冲/直写精确生效, 缓冲写穿透)\n")
+	eprintf("                      缓冲写程序(robocopy/xcopy 默认)的数据写不受限, robocopy 加 /J 走无缓冲\n")
+	eprintf("  --iops <次数/s>     IO 每秒操作数上限(内核口径, 按 8KB 归一化计数;\n")
+	eprintf("                      大块 IO 会退化成 次数*8KB/s 的带宽顶)\n")
+	eprintf("  --seeks <次数/s> <盘...>  限「寻道频率」= 该物理盘的设备层事务数/秒, 如 --seeks 100 D: E:\n")
+	eprintf("                      多盘任意一盘超目标就压; 也可写 all(所有固定卷)。同一物理盘只算一次\n")
+	eprintf("                      顺序大文件事务少 → 几乎不受影响; 大量小文件事务多 → 被压得最狠\n")
+	eprintf("                      吞吐天花板 ≈ 目标 × 平均 IO 大小(100/s: 4KB随机≈0.4MB/s, 1MB顺序≈100MB/s)\n")
 	eprintf("  --procs <个数>      进程数上限\n")
 	eprintf("  --affinity <掩码>   CPU 亲和性, 如 0x0F 或 0,2-5\n")
 	eprintf("  --prio <级别>       idle|below|normal|above|high\n")
 	eprintf("  --no-kill-on-close  limit 被杀时不让子进程陪葬(默认陪葬)\n")
 	eprintf("\n示例: %s --cpu 25%% --mem 2G -- 7z x big.7z -oD:\\out\n", me)
-	eprintf("      %s --io 50 -- xcopy.exe S:\\ D:\\ /E\n", me)
+	eprintf("      %s --io 50 -- robocopy S:\\ D:\\ /E /J\n", me)
+	eprintf("      %s --seeks 100 D: E: -- robocopy S:\\ D:\\ /E   (D/E 任一盘超 100 事务/s 就压)\n", me)
 }
 
 // ---------- main ----------
@@ -214,6 +248,24 @@ optLoop:
 			}
 			L.ioIops = v
 			i += 2
+		case a == "--seeks":
+			if i+2 >= len(args) {
+				eprintf("[limit] --seeks 需要 <次数/s> 和至少一个盘符: --seeks 100 D: E: (或 all)\n")
+				return 2
+			}
+			v, err := strconv.ParseFloat(args[i+1], 64)
+			if err != nil || v <= 0 {
+				eprintf("[limit] --seeks 值无效: %s\n", args[i+1])
+				return 2
+			}
+			letters, n := parseDriveList(args[i+2:])
+			if len(letters) == 0 {
+				eprintf("[limit] --seeks 缺少盘符(应形如 D: 或 all): %s\n", args[i+2])
+				return 2
+			}
+			L.seeks, L.haveSeeks = v, true
+			L.seekLetters = append(L.seekLetters, letters...)
+			i += 2 + n
 		case a == "--procs" && i+1 < len(args):
 			v, err := strconv.Atoi(args[i+1])
 			if err != nil || v < 1 {
