@@ -327,6 +327,15 @@ func terminateJobObject(job syscall.Handle, code uint32) error {
 	return nil
 }
 
+// getProcessIoCounters 读进程级 IO 计数(探测大块顺序 IO 用)。
+func getProcessIoCounters(process syscall.Handle, c *ioCounters) error {
+	r1, _, err := procGetProcessIoCounters.Call(uintptr(process), uintptr(unsafe.Pointer(c)))
+	if r1 == 0 {
+		return err
+	}
+	return nil
+}
+
 func setPriorityClass(process syscall.Handle, class uint32) error {
 	r1, _, err := procSetPriorityClass.Call(uintptr(process), uintptr(class))
 	if r1 == 0 {
@@ -448,6 +457,7 @@ type diskWatch struct {
 // iopsLimiter 监视若干物理盘, 任一盘设备层事务速率超目标就压整棵进程树。
 type iopsLimiter struct {
 	job     syscall.Handle
+	proc    syscall.Handle // 顶层子进程(探测 IO 块大小用)
 	target  float64
 	query   uintptr
 	count   uintptr
@@ -457,6 +467,7 @@ type iopsLimiter struct {
 
 	start       time.Time
 	frozenTotal time.Duration
+	autoOff     bool // 检测到大块顺序 IO 后自动停用挂起限速
 	warned      bool
 	warnMu      sync.Mutex
 
@@ -552,7 +563,7 @@ func utf16PtrToString(p *uint16) string {
 }
 
 // newIopsLimiter 建立 PDH 查询并解析出要监控的物理盘实例。
-func newIopsLimiter(job syscall.Handle, target float64, letters []string) (*iopsLimiter, error) {
+func newIopsLimiter(job, proc syscall.Handle, target float64, letters []string) (*iopsLimiter, error) {
 	if err := procPdhGetRawArray.Find(); err != nil {
 		return nil, fmt.Errorf("PDH 数组接口不可用: %w", err)
 	}
@@ -567,6 +578,7 @@ func newIopsLimiter(job syscall.Handle, target float64, letters []string) (*iops
 	}
 	s := &iopsLimiter{
 		job:     job,
+		proc:    proc,
 		target:  target,
 		letters: letters,
 		stopCh:  make(chan struct{}),
@@ -664,6 +676,22 @@ func (s *iopsLimiter) resolve() error {
 	return nil
 }
 
+// avgTransfer 用 Job 的 IO 记账算「平均每次 IO 传输多少字节」。
+// 大块顺序写(>=256KB/次)说明这是文件级大 IO, 事务率本来就低 —— 既不需要寻道限制,
+// 挂起这种进程又极易撞上内核等待(实测把 robocopy /J 卡成永久僵尸), 所以直接停用。
+func (s *iopsLimiter) avgTransfer() (float64, bool, bool) {
+	var c ioCounters
+	if s.proc == 0 || getProcessIoCounters(s.proc, &c) != nil {
+		return 0, false, false
+	}
+	ops := c.ReadOperationCount + c.WriteOperationCount
+	if ops < 64 { // 样本太少, 别急着下结论
+		return 0, false, false
+	}
+	total := c.ReadTransferCount + c.WriteTransferCount
+	return float64(total) / float64(ops), true, true
+}
+
 // run 在子进程存活期间持续限速; 返回的 stop 给出实测数据。
 func (s *iopsLimiter) run() func() *iopsReport {
 	s.frz = newFreezer(s.job)
@@ -680,8 +708,8 @@ func (s *iopsLimiter) run() func() *iopsReport {
 		prevT := time.Now()
 		tickStart := prevT
 		var frozenInTick time.Duration
-		frozenRound := false // 上一轮是否以「冻结」收尾
-		budgetHits := 0      // 连续多少个采样周期把冻结预算用满
+		budgetHits := 0 // 连续多少个采样周期把冻结预算用满
+		lastProbe := time.Now()
 		for {
 			select {
 			case <-s.stopCh:
@@ -715,15 +743,10 @@ func (s *iopsLimiter) run() func() *iopsReport {
 				if rate > w.max {
 					w.max = rate
 				}
-				if frozenRound {
-					// 冻结期间观测到的增量是「在途 IO 完成 + 别的程序」, 不是我们新发出的
-					// 请求。计费会把它算成我们的欠账, 于是 debt 永远还不清 → 占空比拉满、
-					// 目标 100/s 时自然率只有 83/s 也照冻(实测 80%+ 占空比、整盘只剩 19/s)。
-					// 这一段只按目标预算偿还, 不累加 delta。
-					w.debt -= s.target * dt
-				} else {
-					w.debt += delta - s.target*dt
-				}
+				// 全量记账(含冻结期间完成的在途 IO): 计数器是整盘口径, 这笔增量真实存在,
+				// 不记它就会系统性超标(小文件实测超 41%)。大块顺序负载靠平均块大小探测
+				// 自动停用, 而不是靠少记账。
+				w.debt += delta - s.target*dt
 				if w.debt < 0 {
 					w.debt = 0
 				} else if cap := s.target * iopsDebtCap; w.debt > cap {
@@ -733,13 +756,34 @@ func (s *iopsLimiter) run() func() *iopsReport {
 					worst = t
 				}
 			}
+			if !s.autoOff && time.Since(lastProbe) > time.Second {
+				lastProbe = time.Now()
+				if avg, ok, read := s.avgTransfer(); read && ok {
+					if avg >= 256*1024 {
+						s.autoOff = true
+						eprintf("[limit] 提示: 目标在做大块顺序 IO(平均 %.0f KB/次), 事务率本来就低、不需要限寻道;\n", avg/1024)
+						eprintf("[limit]       已自动停用 --iops 的挂起限速(避免拖慢甚至卡死); 只想让路请用 --io-prio verylow\n")
+					}
+				}
+			}
+			if s.autoOff {
+				// 停用后只继续统计, 不再冻结
+				if r := iopsTick - time.Since(tickStart); r > 0 {
+					time.Sleep(r)
+				}
+				tickStart, frozenInTick = time.Now(), 0
+				for _, w := range s.watches {
+					w.debt = 0
+				}
+				continue
+			}
 			if worst < 0.003 {
 				budgetHits = 0
 				// 达标: 补满本次采样周期, 让目标进程全速跑
 				if r := iopsTick - time.Since(tickStart); r > 0 {
 					time.Sleep(r)
 				}
-				tickStart, frozenInTick, frozenRound = time.Now(), 0, false
+				tickStart, frozenInTick = time.Now(), 0
 				continue
 			}
 			// 还债: 按 need = 欠账/目标 冻结, 分块(5ms..250ms), 冻完立刻复采样
@@ -761,20 +805,19 @@ func (s *iopsLimiter) run() func() *iopsReport {
 				if r := iopsTick - time.Since(tickStart); r > 0 {
 					time.Sleep(r)
 				}
-				tickStart, frozenInTick, frozenRound = time.Now(), 0, false
+				tickStart, frozenInTick = time.Now(), 0
 				continue
 			}
 			if !s.frz.set(true) {
 				// 目标进程已退出(或拿不到句柄): 别空转, 让出去一个采样周期
 				time.Sleep(iopsTick)
-				tickStart, frozenInTick, frozenRound = time.Now(), 0, false
+				tickStart, frozenInTick = time.Now(), 0
 				continue
 			}
 			time.Sleep(frz)
 			s.frz.set(false)
 			frozenInTick += frz
 			s.frozenTotal += frz
-			frozenRound = true
 		}
 	}()
 	return func() *iopsReport {
@@ -959,7 +1002,7 @@ func runWindows(L *limits, cmdArgs []string) int {
 		if len(drives) == 0 {
 			drives = []string{"all"}
 		}
-		lim, err := newIopsLimiter(job, L.ioIops, drives)
+		lim, err := newIopsLimiter(job, pi.HProcess, L.ioIops, drives)
 		if err != nil {
 			eprintf("[limit] --iops 初始化失败: %v\n", err)
 			return 1
