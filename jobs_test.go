@@ -6,6 +6,7 @@ package main
 
 import (
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -135,6 +136,32 @@ func TestParseAffinity(t *testing.T) {
 		got, ok := parseAffinity(c.in)
 		if ok != c.ok || (ok && got != c.want) {
 			t.Errorf("parseAffinity(%q) = (%#x, %v), want (%#x, %v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestParseDuration(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+		ok   bool
+	}{
+		{"90s", 90 * time.Second, true},
+		{"10m", 10 * time.Minute, true},
+		{"1h", time.Hour, true},
+		{"1h30m", 90 * time.Minute, true},
+		{"500ms", 500 * time.Millisecond, true},
+		{"3600", time.Hour, true}, // 纯数字 = 秒
+		{"0.5", 500 * time.Millisecond, true},
+		{"0", 0, false},
+		{"-5s", 0, false},
+		{"abc", 0, false},
+		{"", 0, false},
+	}
+	for _, c := range cases {
+		got, ok := parseDuration(c.in)
+		if ok != c.ok || (ok && got != c.want) {
+			t.Errorf("parseDuration(%q) = (%v, %v), want (%v, %v)", c.in, got, ok, c.want, c.ok)
 		}
 	}
 }

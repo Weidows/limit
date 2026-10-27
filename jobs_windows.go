@@ -9,12 +9,12 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -39,6 +39,7 @@ var (
 
 	// Job Object I/O rate control: 运行时解析, Win7 及更早不存在
 	procSetIoRateControlInformationJobObject = kernel32.NewProc("SetIoRateControlInformationJobObject")
+	procTerminateJobObject                   = kernel32.NewProc("TerminateJobObject")
 )
 
 // JobObjectInformationClass(用到的; 不能与结构体同名, Go 单命名空间)
@@ -267,6 +268,15 @@ func getExitCodeProcess(process syscall.Handle) (uint32, error) {
 	return code, nil
 }
 
+// terminateJobObject 终止 Job 内全部进程(超时收工用)。
+func terminateJobObject(job syscall.Handle, code uint32) error {
+	r1, _, err := procTerminateJobObject.Call(uintptr(job), uintptr(code))
+	if r1 == 0 {
+		return err
+	}
+	return nil
+}
+
 func setPriorityClass(process syscall.Handle, class uint32) error {
 	r1, _, err := procSetPriorityClass.Call(uintptr(process), uintptr(class))
 	if r1 == 0 {
@@ -283,8 +293,8 @@ func closeHandle(handle syscall.Handle) error {
 	return nil
 }
 
-// 同时设带宽与 IOPS 两个顶, 哪个先撞上哪个生效; 传 0 表示该维度不限。
-// 顺序大块 IO 每个只算 1 次操作, 走带宽顶; 随机小 IO 才撞 IOPS 顶——正好对应 HDD 两类负载。
+// 只设带宽顶(--io)。IOPS 维度不再走这条内核 API: 它按 8KB 归一化计数、和寻道无关,
+// --iops 已改为设备层事务率 + 占空比冻结(见下面的 iopsLimiter)。传 0 表示不设该维度。
 func setIoRateControl(job syscall.Handle, maxBandwidthBytes, maxIops int64) error {
 	// Find() 内部即 GetProcAddress; 不存在时明确报错, 不静默
 	if err := procSetIoRateControlInformationJobObject.Find(); err != nil {
@@ -303,7 +313,7 @@ func setIoRateControl(job syscall.Handle, maxBandwidthBytes, maxIops int64) erro
 	return nil
 }
 
-// ---------- 寻道频率限制(seek rate) ----------
+// ---------- 设备层速率限制(--iops: HDD 寻道频率) ----------
 //
 // 目标只有一个: 保护 HDD 磁头。设备层 `Disk Transfers/sec` 是寻道频率的可用代理:
 //
@@ -332,12 +342,12 @@ const (
 	processQueryInfo     = 0x0400 // IsProcessInJob 需要 QUERY_INFORMATION
 	processSuspendResume = 0x0800
 
-	seekTick       = 20 * time.Millisecond  // 采样周期
-	seekChunkMin   = 5 * time.Millisecond   // 单次冻结下限
-	seekChunkMax   = 250 * time.Millisecond // 单次冻结上限
-	seekTickBudget = 900 * time.Millisecond // 单个采样周期内最多冻结多久
-	seekDebtCap    = 2.0                    // 欠账上限(目标×秒), 防止长期冻死
-	seekPidRefresh = 300 * time.Millisecond // 刷新 Job 内进程句柄的间隔
+	iopsTick       = 20 * time.Millisecond  // 采样周期
+	iopsChunkMin   = 5 * time.Millisecond   // 单次冻结下限
+	iopsChunkMax   = 250 * time.Millisecond // 单次冻结上限
+	iopsTickBudget = 900 * time.Millisecond // 单个采样周期内最多冻结多久
+	iopsDebtCap    = 2.0                    // 欠账上限(目标×秒), 防止长期冻死
+	iopsPidRefresh = 300 * time.Millisecond // 刷新 Job 内进程句柄的间隔
 )
 
 var (
@@ -374,8 +384,8 @@ type pdhRawCounterItem struct {
 	Raw  pdhRawCounter
 }
 
-// seekWatch 一块被监控的物理盘(设备层实例), name 形如 "1 D:" / "2 E: F:"。
-type seekWatch struct {
+// diskWatch 一块被监控的物理盘(设备层实例), name 形如 "1 D:" / "2 E: F:"。
+type diskWatch struct {
 	name    string
 	prev    uint64  // 上次读到的累积事务数
 	debt    float64 // 欠账(事务数), 只记正超额
@@ -384,14 +394,14 @@ type seekWatch struct {
 	samples int
 }
 
-// seekLimiter 监视若干物理盘, 任一盘设备层事务速率超目标就压整棵进程树。
-type seekLimiter struct {
+// iopsLimiter 监视若干物理盘, 任一盘设备层事务速率超目标就压整棵进程树。
+type iopsLimiter struct {
 	job     syscall.Handle
 	target  float64
 	query   uintptr
 	count   uintptr
 	letters []string // 用户指定的盘符小写(或 "all")
-	watches []*seekWatch
+	watches []*diskWatch
 	frz     *freezer
 
 	start       time.Time
@@ -403,14 +413,14 @@ type seekLimiter struct {
 	done   chan struct{}
 }
 
-// seekReport 结束时的实测数据(整盘口径: 同盘其他程序也计入)。
-type seekReport struct {
+// iopsReport 结束时的实测数据(整盘口径: 同盘其他程序也计入)。
+type iopsReport struct {
 	elapsed float64
 	frozen  float64
-	rows    []seekRow
+	rows    []iopsRow
 }
 
-type seekRow struct {
+type iopsRow struct {
 	name string
 	avg  float64
 	max  float64
@@ -451,7 +461,7 @@ func (f *freezer) set(on bool) {
 	if on == f.frozen {
 		return
 	}
-	if len(f.handles) == 0 || time.Since(f.lastRefresh) > seekPidRefresh {
+	if len(f.handles) == 0 || time.Since(f.lastRefresh) > iopsPidRefresh {
 		f.refresh()
 	}
 	for _, h := range f.handles {
@@ -484,8 +494,8 @@ func utf16PtrToString(p *uint16) string {
 	return syscall.UTF16ToString(unsafe.Slice(p, n))
 }
 
-// newSeekLimiter 建立 PDH 查询并解析出要监控的物理盘实例。
-func newSeekLimiter(job syscall.Handle, target float64, letters []string) (*seekLimiter, error) {
+// newIopsLimiter 建立 PDH 查询并解析出要监控的物理盘实例。
+func newIopsLimiter(job syscall.Handle, target float64, letters []string) (*iopsLimiter, error) {
 	if err := procPdhGetRawArray.Find(); err != nil {
 		return nil, fmt.Errorf("PDH 数组接口不可用: %w", err)
 	}
@@ -498,7 +508,7 @@ func newSeekLimiter(job syscall.Handle, target float64, letters []string) (*seek
 			return nil, fmt.Errorf("盘 %s: 不存在或不可访问", l)
 		}
 	}
-	s := &seekLimiter{
+	s := &iopsLimiter{
 		job:     job,
 		target:  target,
 		letters: letters,
@@ -531,7 +541,7 @@ func newSeekLimiter(job syscall.Handle, target float64, letters []string) (*seek
 }
 
 // readAll 读全部物理盘实例的累积事务数。
-func (s *seekLimiter) readAll() (map[string]uint64, bool) {
+func (s *iopsLimiter) readAll() (map[string]uint64, bool) {
 	if r, _, _ := procPdhCollectQuery.Call(s.query); r != 0 {
 		return nil, false
 	}
@@ -563,7 +573,7 @@ func (s *seekLimiter) readAll() (map[string]uint64, bool) {
 }
 
 // resolve 把盘符映射成物理盘实例; 同一物理盘被多个盘符命中只登记一次。
-func (s *seekLimiter) resolve() error {
+func (s *iopsLimiter) resolve() error {
 	cur, ok := s.readAll()
 	if !ok {
 		return fmt.Errorf("读不到 PhysicalDisk 计数器")
@@ -588,7 +598,7 @@ func (s *seekLimiter) resolve() error {
 				continue
 			}
 			seen[n] = true
-			s.watches = append(s.watches, &seekWatch{name: n})
+			s.watches = append(s.watches, &diskWatch{name: n})
 		}
 		if hit == 0 {
 			return fmt.Errorf("盘 %s: 找不到设备层 IO 计数器(该盘可能不是固定磁盘)", want)
@@ -598,7 +608,7 @@ func (s *seekLimiter) resolve() error {
 }
 
 // run 在子进程存活期间持续限速; 返回的 stop 给出实测数据。
-func (s *seekLimiter) run() func() *seekReport {
+func (s *iopsLimiter) run() func() *iopsReport {
 	s.frz = newFreezer(s.job)
 	s.start = time.Now()
 	go func() {
@@ -649,7 +659,7 @@ func (s *seekLimiter) run() func() *seekReport {
 				w.debt += delta - s.target*dt
 				if w.debt < 0 {
 					w.debt = 0
-				} else if cap := s.target * seekDebtCap; w.debt > cap {
+				} else if cap := s.target * iopsDebtCap; w.debt > cap {
 					w.debt = cap
 				}
 				if t := w.debt / s.target; t > worst {
@@ -658,7 +668,7 @@ func (s *seekLimiter) run() func() *seekReport {
 			}
 			if worst < 0.003 {
 				// 达标: 补满本次采样周期, 让目标进程全速跑
-				if r := seekTick - time.Since(tickStart); r > 0 {
+				if r := iopsTick - time.Since(tickStart); r > 0 {
 					time.Sleep(r)
 				}
 				tickStart, frozenInTick = time.Now(), 0
@@ -666,19 +676,19 @@ func (s *seekLimiter) run() func() *seekReport {
 			}
 			// 还债: 按 need = 欠账/目标 冻结, 分块(5ms..250ms), 冻完立刻复采样
 			frz := time.Duration(worst * float64(time.Second))
-			if frz < seekChunkMin {
-				frz = seekChunkMin
+			if frz < iopsChunkMin {
+				frz = iopsChunkMin
 			}
-			if frz > seekChunkMax {
-				frz = seekChunkMax
+			if frz > iopsChunkMax {
+				frz = iopsChunkMax
 			}
-			if left := seekTickBudget - frozenInTick; frz > left {
+			if left := iopsTickBudget - frozenInTick; frz > left {
 				frz = left
 			}
 			if frz <= 0 {
 				// 本周期冻结预算用尽: 让出去一小会再继续, 并只告警一次
 				s.warnOnce()
-				if r := seekTick - time.Since(tickStart); r > 0 {
+				if r := iopsTick - time.Since(tickStart); r > 0 {
 					time.Sleep(r)
 				}
 				tickStart, frozenInTick = time.Now(), 0
@@ -691,7 +701,7 @@ func (s *seekLimiter) run() func() *seekReport {
 			s.frozenTotal += frz
 		}
 	}()
-	return func() *seekReport {
+	return func() *iopsReport {
 		close(s.stopCh)
 		<-s.done
 		s.frz.close()
@@ -699,9 +709,9 @@ func (s *seekLimiter) run() func() *seekReport {
 		if el <= 0 {
 			el = 1e-9
 		}
-		rep := &seekReport{elapsed: el, frozen: s.frozenTotal.Seconds() / el}
+		rep := &iopsReport{elapsed: el, frozen: s.frozenTotal.Seconds() / el}
 		for _, w := range s.watches {
-			rep.rows = append(rep.rows, seekRow{
+			rep.rows = append(rep.rows, iopsRow{
 				name: w.name,
 				avg:  w.total / el,
 				max:  w.max,
@@ -712,7 +722,7 @@ func (s *seekLimiter) run() func() *seekReport {
 	}
 }
 
-func (s *seekLimiter) warnOnce() {
+func (s *iopsLimiter) warnOnce() {
 	s.warnMu.Lock()
 	defer s.warnMu.Unlock()
 	if s.warned {
@@ -723,13 +733,13 @@ func (s *seekLimiter) warnOnce() {
 		"或目标设得过低; 已保持最大压制继续运行\n", s.target)
 }
 
-// describe 供启动摘要行使用, 形如 "seeks<=50/s@d: e:" / "seeks<=50/s@all"。
-func (s *seekLimiter) describe() string {
+// describe 供启动摘要行使用, 形如 "iops<=200/s@[1 d:, 0 e:]"。
+func (s *iopsLimiter) describe() string {
 	parts := make([]string, 0, len(s.watches))
 	for _, w := range s.watches {
 		parts = append(parts, strings.ToLower(w.name))
 	}
-	return fmt.Sprintf("seeks<=%.0f/s@[%s]", s.target, strings.Join(parts, ", "))
+	return fmt.Sprintf("iops<=%.0f/s@[%s]", s.target, strings.Join(parts, ", "))
 }
 
 // pidsInJob 枚举 Job 内全部进程(含孙进程)。
@@ -831,10 +841,9 @@ func runWindows(L *limits, cmdArgs []string) int {
 		}
 	}
 
-	if L.ioMBps > 0 || L.ioIops > 0 {
+	if L.ioMBps > 0 {
 		bw := int64(L.ioMBps * 1024 * 1024)
-		iops := int64(math.Round(L.ioIops))
-		if err := setIoRateControl(job, bw, iops); err != nil {
+		if err := setIoRateControl(job, bw, 0); err != nil {
 			eprintf("[limit] 设置 IO 限速失败: %v\n", err)
 			return 1
 		}
@@ -861,18 +870,40 @@ func runWindows(L *limits, cmdArgs []string) int {
 		eprintf("[limit] 恢复子进程失败: %v\n", err)
 	}
 
-	// --seeks: 启动设备层寻道频率限制(多物理盘 + 细粒度占空比冻结)
-	var stopSeek func() *seekReport
-	var seekLim *seekLimiter
-	if L.haveSeeks {
-		lim, err := newSeekLimiter(job, L.seeks, L.seekLetters)
+	// --iops: 启动设备层「寻道频率」限制(多物理盘 + 细粒度占空比冻结)
+	var stopIops func() *iopsReport
+	var iopsLim *iopsLimiter
+	if L.ioIops > 0 {
+		drives := L.iopsDrives
+		if len(drives) == 0 {
+			drives = []string{"all"}
+		}
+		lim, err := newIopsLimiter(job, L.ioIops, drives)
 		if err != nil {
-			eprintf("[limit] --seeks 初始化失败: %v\n", err)
+			eprintf("[limit] --iops 初始化失败: %v\n", err)
 			return 1
 		}
 		defer procPdhCloseQuery.Call(lim.query)
-		seekLim = lim
-		stopSeek = lim.run()
+		iopsLim = lim
+		stopIops = lim.run()
+	}
+
+	// --timeout: 墙钟计时, 到点 TerminateJobObject 整棵树(子孙一起走)
+	var timedOut int32
+	timeoutDone := make(chan struct{})
+	if L.haveTmout {
+		go func() {
+			t := time.NewTimer(L.timeout)
+			defer t.Stop()
+			select {
+			case <-t.C:
+				atomic.StoreInt32(&timedOut, 1)
+				if err := terminateJobObject(job, 124); err != nil {
+					eprintf("[limit] 超时终止整棵树失败: %v\n", err)
+				}
+			case <-timeoutDone:
+			}
+		}()
 	}
 
 	// ---- 摘要行 ----
@@ -889,11 +920,8 @@ func runWindows(L *limits, cmdArgs []string) int {
 	if L.ioMBps > 0 {
 		summary += fmt.Sprintf(" io<=%.0fMB/s", L.ioMBps)
 	}
-	if L.ioIops > 0 {
-		summary += fmt.Sprintf(" iops<=%.0f/s", L.ioIops)
-	}
-	if seekLim != nil {
-		summary += " " + seekLim.describe()
+	if iopsLim != nil {
+		summary += " " + iopsLim.describe()
 	}
 	if L.procs != 0 {
 		summary += fmt.Sprintf(" procs<=%d", L.procs)
@@ -904,14 +932,18 @@ func runWindows(L *limits, cmdArgs []string) int {
 	if L.havePrio {
 		summary += fmt.Sprintf(" prio=%#x", L.prio)
 	}
+	if L.haveTmout {
+		summary += fmt.Sprintf(" timeout=%s", L.timeout)
+	}
 	eprintf("%s\n", summary)
 
 	if err := waitForSingleObject(pi.HProcess); err != nil {
 		eprintf("[limit] 等待子进程失败: %v\n", err)
 	}
-	if stopSeek != nil {
-		rep := stopSeek()
-		eprintf("[limit] seeks 目标 %.0f/s | 设备层实测(整盘口径):\n", L.seeks)
+	close(timeoutDone)
+	if stopIops != nil {
+		rep := stopIops()
+		eprintf("[limit] iops 目标 %.0f/s | 设备层实测(整盘口径):\n", L.ioIops)
 		for _, r := range rep.rows {
 			eprintf("[limit]   %-12s 均值 %.0f/s  峰值 %.0f/s  (共 %.0f 事务)\n",
 				strings.ToLower(r.name), r.avg, r.max, r.ops)
@@ -925,6 +957,10 @@ func runWindows(L *limits, cmdArgs []string) int {
 	closeHandle(pi.HProcess)
 	closeHandle(pi.HThread)
 
+	if atomic.LoadInt32(&timedOut) != 0 {
+		eprintf("[limit] 超时 %s: 已终止整棵进程树, 返回 124\n", L.timeout)
+	}
+
 	// ---- 退出统计 ----
 	var acc jobObjectBasicAccountingInformation
 	if err := queryInformationJobObject(job, jobObjectInfoClassBasicAccounting,
@@ -937,6 +973,9 @@ func runWindows(L *limits, cmdArgs []string) int {
 		unsafe.Pointer(&q), unsafe.Sizeof(q)); err == nil {
 		eprintf("[limit] 峰值 commit: 单进程 %.0f MB / 整棵树 %.0f MB\n",
 			float64(q.PeakProcessMemoryUsed)/1e6, float64(q.PeakJobMemoryUsed)/1e6)
+	}
+	if atomic.LoadInt32(&timedOut) != 0 {
+		return 124
 	}
 	return int(code)
 }

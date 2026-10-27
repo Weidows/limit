@@ -2,7 +2,8 @@
 //
 // 用法:
 //
-//	limit [--cpu 25%] [--mem 512M] [--io 50MB/s] [--seeks 200 D: E:] [--procs 8]
+//	limit [--cpu 25%] [--mem 512M] [--io 50MB/s] [--iops 200 D: E:] [--timeout 2h]
+//	      [--procs 8]
 //	      [--affinity 0,2-5] [--prio below] [--no-kill-on-close] -- 7z x a.7z -oout\
 //
 // 平台: 限制机制是 Windows Job Object(整棵进程树生效)。本程序也提供
@@ -14,9 +15,11 @@
 //     磁盘仍会爆发。缓存写场景可用 --cpu 顶当 IO 节流阀(见 README)。
 //   - --mem 是 commit(虚拟内存提交)口径硬顶; RSS 只有软限。
 //   - 网络带宽/统一磁盘 IO 需要签名内核驱动, 用户态做不到。
-//   - --seeks 面向 HDD 保护磁头: 限的是「整盘设备层事务数/秒」(其他程序也计入),
+//   - --iops 面向 HDD 保护磁头: 限的是「物理盘设备层事务数/秒」(其他程序也计入),
 //     大文件事务少几乎不受影响, 大量小文件被削得最狠。冻结不分盘: 任一盘超标时
 //     整棵树(含另一盘的 IO)一起停。目标值按「能接受的顺序吞吐 ÷ 平均 IO 大小」倒推。
+//   - --timeout 按墙钟计时(限速冻结的时间也算), 到期 TerminateJobObject 整棵树,
+//     退出码 124(与 coreutils timeout 一致)。
 package main
 
 import (
@@ -25,6 +28,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type limits struct {
@@ -34,9 +38,9 @@ type limits struct {
 	memTotal    uintptr
 	ioMBps      float64
 	ioIops      float64
-	seeks       float64
-	haveSeeks   bool
-	seekLetters []string // 盘符(小写)或 "all"
+	iopsDrives  []string // 只盯这些盘(小写盘符); 空 = 所有固定卷
+	timeout     time.Duration
+	haveTmout   bool
 	procs       uint32
 	affinity    uintptr
 	haveAff     bool
@@ -127,8 +131,27 @@ func parseAffinity(s string) (uintptr, bool) {
 	return mask, true
 }
 
+// parseDuration 解析 --timeout 的时长: 90s / 10m / 1h / 1h30m / 500ms, 纯数字按秒。
+func parseDuration(s string) (time.Duration, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	if v, err := strconv.ParseFloat(s, 64); err == nil {
+		if v <= 0 {
+			return 0, false
+		}
+		return time.Duration(v * float64(time.Second)), true
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, false
+	}
+	return d, true
+}
+
 // parseDriveList 吃掉参数流里连续的盘符 token(形如 D: / D / all), 返回小写盘符和消耗个数。
-// 多盘监控靠它: --seeks 100 D: E: 表示「任一盘超 100 事务/s 就压」。
+// 多盘监控靠它: --iops 200 D: E: 表示「这两盘任一超 200 事务/s 就压」。
 func parseDriveList(args []string) ([]string, int) {
 	var out []string
 	n := 0
@@ -174,19 +197,20 @@ func usage(me string) {
 	eprintf("  --mem-total <大小>  整棵树 commit 内存硬顶\n")
 	eprintf("  --io <MB/s>         磁盘 IO 速率(读写合计; 无缓冲/直写精确生效, 缓冲写穿透)\n")
 	eprintf("                      缓冲写程序(robocopy/xcopy 默认)的数据写不受限, robocopy 加 /J 走无缓冲\n")
-	eprintf("  --iops <次数/s>     IO 每秒操作数上限(内核口径, 按 8KB 归一化计数;\n")
-	eprintf("                      大块 IO 会退化成 次数*8KB/s 的带宽顶)\n")
-	eprintf("  --seeks <次数/s> <盘...>  限「寻道频率」= 该物理盘的设备层事务数/秒, 如 --seeks 100 D: E:\n")
-	eprintf("                      多盘任意一盘超目标就压; 也可写 all(所有固定卷)。同一物理盘只算一次\n")
-	eprintf("                      顺序大文件事务少 → 几乎不受影响; 大量小文件事务多 → 被压得最狠\n")
-	eprintf("                      吞吐天花板 ≈ 目标 × 平均 IO 大小(100/s: 4KB随机≈0.4MB/s, 1MB顺序≈100MB/s)\n")
+	eprintf("  --iops <次数/s> [盘...]  限「寻道频率」= 物理盘设备层事务数/秒(免管理员)\n")
+	eprintf("                      不给盘符 = 所有固定卷; 也可 --iops 200 D: E: 只盯这两盘\n")
+	eprintf("                      任一被盯的盘超目标就冻结整棵树; 同一物理盘只算一次\n")
+	eprintf("                      顺序大文件事务少 → 几乎无感; 大量小文件事务多 → 压得最狠\n")
+	eprintf("                      吞吐天花板 ≈ 目标 × 平均 IO 大小(200/s: 4KB≈0.8MB/s, 1MB≈200MB/s)\n")
 	eprintf("  --procs <个数>      进程数上限\n")
 	eprintf("  --affinity <掩码>   CPU 亲和性, 如 0x0F 或 0,2-5\n")
 	eprintf("  --prio <级别>       idle|below|normal|above|high\n")
+	eprintf("  --timeout <时长>    超时后终止整棵树并返回 124, 如 90s / 10m / 1h(纯数字=秒)\n")
 	eprintf("  --no-kill-on-close  limit 被杀时不让子进程陪葬(默认陪葬)\n")
 	eprintf("\n示例: %s --cpu 25%% --mem 2G -- 7z x big.7z -oD:\\out\n", me)
 	eprintf("      %s --io 50 -- robocopy S:\\ D:\\ /E /J\n", me)
-	eprintf("      %s --seeks 100 D: E: -- robocopy S:\\ D:\\ /E   (D/E 任一盘超 100 事务/s 就压)\n", me)
+	eprintf("      %s --iops 200 D: E: -- robocopy S:\\ D:\\backup /E   (任一盘超 200 事务/s 就压)\n", me)
+	eprintf("      %s --timeout 2h -- robocopy S:\\ D:\\backup /E /J    (2 小时后强制收工)\n", me)
 }
 
 // ---------- main ----------
@@ -247,25 +271,12 @@ optLoop:
 				return 2
 			}
 			L.ioIops = v
+			// 可选: 跟一串盘符, 只盯这些盘; 不写就盯所有固定卷
+			if drives, n := parseDriveList(args[i+2:]); n > 0 {
+				L.iopsDrives = append(L.iopsDrives, drives...)
+				i += n
+			}
 			i += 2
-		case a == "--seeks":
-			if i+2 >= len(args) {
-				eprintf("[limit] --seeks 需要 <次数/s> 和至少一个盘符: --seeks 100 D: E: (或 all)\n")
-				return 2
-			}
-			v, err := strconv.ParseFloat(args[i+1], 64)
-			if err != nil || v <= 0 {
-				eprintf("[limit] --seeks 值无效: %s\n", args[i+1])
-				return 2
-			}
-			letters, n := parseDriveList(args[i+2:])
-			if len(letters) == 0 {
-				eprintf("[limit] --seeks 缺少盘符(应形如 D: 或 all): %s\n", args[i+2])
-				return 2
-			}
-			L.seeks, L.haveSeeks = v, true
-			L.seekLetters = append(L.seekLetters, letters...)
-			i += 2 + n
 		case a == "--procs" && i+1 < len(args):
 			v, err := strconv.Atoi(args[i+1])
 			if err != nil || v < 1 {
@@ -292,6 +303,14 @@ optLoop:
 				return 2
 			}
 			L.havePrio = true
+			i += 2
+		case a == "--timeout" && i+1 < len(args):
+			v, ok := parseDuration(args[i+1])
+			if !ok {
+				eprintf("[limit] --timeout 值无效: %s (示例: 90s / 10m / 1h / 3600)\n", args[i+1])
+				return 2
+			}
+			L.timeout, L.haveTmout = v, true
 			i += 2
 		case a == "--no-kill-on-close":
 			L.killOnClose = false
