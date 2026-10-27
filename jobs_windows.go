@@ -40,6 +40,7 @@ var (
 	// Job Object I/O rate control: 运行时解析, Win7 及更早不存在
 	procSetIoRateControlInformationJobObject = kernel32.NewProc("SetIoRateControlInformationJobObject")
 	procTerminateJobObject                   = kernel32.NewProc("TerminateJobObject")
+	procSetConsoleCtrlHandler                = kernel32.NewProc("SetConsoleCtrlHandler")
 )
 
 // JobObjectInformationClass(用到的; 不能与结构体同名, Go 单命名空间)
@@ -268,6 +269,55 @@ func getExitCodeProcess(process syscall.Handle) (uint32, error) {
 	return code, nil
 }
 
+// consoleCleanup 由 runWindows 注册: 收到 Ctrl+C / 关窗时先把被挂起的子进程恢复,
+// 再按 killOnClose 终止整棵树。
+//
+// 为什么必须显式做: NtSuspendProcess 的挂起计数不会因为父进程退出而回滚,
+// 而"先挂起、后终止"在 IO 密集进程上还可能留下卡在内核等待里的僵尸。
+var consoleCleanup func()
+
+func consoleCtrlHandler(ctrlType uint32) uintptr {
+	if consoleCleanup != nil {
+		consoleCleanup()
+	}
+	os.Exit(130)
+	return 0
+}
+
+func installConsoleCleanup(fn func()) {
+	consoleCleanup = fn
+	cb := syscall.NewCallback(consoleCtrlHandler)
+	procSetConsoleCtrlHandler.Call(cb, 1)
+}
+
+// ioPriorityClass 把 --io-prio 字符串映射成 IO_PRIORITY_HINT(0=VeryLow .. 3=High)。
+func ioPriorityClass(p string) uint32 {
+	switch p {
+	case "verylow":
+		return 0
+	case "low":
+		return 1
+	case "normal":
+		return 2
+	default:
+		return 3
+	}
+}
+
+// setIoPriority 设置进程 IO 优先级(IO_PRIORITY_HINT)。这是**不给进程添风险**的降速/让路手段:
+// 低 IO 优先级的请求会被存储栈排到别人后面, 不会像冻结那样把线程挂起。
+// 作用于已启动的进程; 其后新建的线程/子进程不保证继承。
+func setIoPriority(process syscall.Handle, prio uint32) error {
+	const processIoPriority = 33 // PROCESSINFOCLASS.ProcessIoPriority
+	v := prio
+	r1, _, err := procNtSetInformationProcess.Call(
+		uintptr(process), processIoPriority, uintptr(unsafe.Pointer(&v)), unsafe.Sizeof(v))
+	if int32(r1) < 0 {
+		return err
+	}
+	return nil
+}
+
 // terminateJobObject 终止 Job 内全部进程(超时收工用)。
 func terminateJobObject(job syscall.Handle, code uint32) error {
 	r1, _, err := procTerminateJobObject.Call(uintptr(job), uintptr(code))
@@ -343,7 +393,7 @@ const (
 	processSuspendResume = 0x0800
 
 	iopsTick       = 20 * time.Millisecond  // 采样周期
-	iopsChunkMin   = 5 * time.Millisecond   // 单次冻结下限
+	iopsChunkMin   = 50 * time.Millisecond  // 单次冻结下限(别调小: 切换太勤容易撞上内核等待)
 	iopsChunkMax   = 250 * time.Millisecond // 单次冻结上限
 	iopsTickBudget = 900 * time.Millisecond // 单个采样周期内最多冻结多久
 	iopsDebtCap    = 2.0                    // 欠账上限(目标×秒), 防止长期冻死
@@ -356,9 +406,10 @@ var (
 	procProcess32NextW           = kernel32.NewProc("Process32NextW")
 	procIsProcessInJob           = kernel32.NewProc("IsProcessInJob")
 
-	ntdll                = syscall.NewLazyDLL("ntdll.dll")
-	procNtSuspendProcess = ntdll.NewProc("NtSuspendProcess")
-	procNtResumeProcess  = ntdll.NewProc("NtResumeProcess")
+	ntdll                       = syscall.NewLazyDLL("ntdll.dll")
+	procNtSuspendProcess        = ntdll.NewProc("NtSuspendProcess")
+	procNtResumeProcess         = ntdll.NewProc("NtResumeProcess")
+	procNtSetInformationProcess = ntdll.NewProc("NtSetInformationProcess")
 
 	pdhDLL              = syscall.NewLazyDLL("pdh.dll")
 	procPdhOpenQuery    = pdhDLL.NewProc("PdhOpenQueryW")
@@ -891,6 +942,11 @@ func runWindows(L *limits, cmdArgs []string) int {
 	if L.havePrio {
 		setPriorityClass(pi.HProcess, prioClassValue(L.prio))
 	}
+	if L.haveIoPrio {
+		if err := setIoPriority(pi.HProcess, ioPriorityClass(L.ioPrio)); err != nil {
+			eprintf("[limit] 设置 IO 优先级失败(已忽略): %v\n", err)
+		}
+	}
 	if err := resumeThread(pi.HThread); err != nil {
 		eprintf("[limit] 恢复子进程失败: %v\n", err)
 	}
@@ -926,10 +982,26 @@ func runWindows(L *limits, cmdArgs []string) int {
 				if err := terminateJobObject(job, 124); err != nil {
 					eprintf("[limit] 超时终止整棵树失败: %v\n", err)
 				}
+				// 兜底: 进程若卡在内核等待里(如被挂起时撞上同步 IO), TerminateJobObject 也带不走它,
+				// 此时不能陪它一起永远等下去 —— 等 8 秒仍不退出就自己走人。
+				time.Sleep(8 * time.Second)
+				eprintf("[limit] 目标进程 8 秒内未退出(可能卡在内核等待), limit 强制退出; " +
+					"残留进程可能需要重启系统才能清理\n")
+				os.Exit(124)
 			case <-timeoutDone:
 			}
 		}()
 	}
+
+	// Ctrl+C / 关窗: 先恢复挂起的子进程, 再按 killOnClose 收工 —— 不留挂起态孤儿
+	installConsoleCleanup(func() {
+		if iopsLim != nil && iopsLim.frz != nil {
+			iopsLim.frz.set(false)
+		}
+		if L.killOnClose {
+			terminateJobObject(job, 1)
+		}
+	})
 
 	// ---- 摘要行 ----
 	summary := fmt.Sprintf("[limit] 运行中 (pid %d):", pi.DwProcessId)
@@ -955,7 +1027,10 @@ func runWindows(L *limits, cmdArgs []string) int {
 		summary += fmt.Sprintf(" affinity=%#x", L.affinity)
 	}
 	if L.havePrio {
-		summary += fmt.Sprintf(" prio=%#x", L.prio)
+		summary += fmt.Sprintf(" prio=%s", L.prio)
+	}
+	if L.haveIoPrio {
+		summary += fmt.Sprintf(" io_prio=%s", L.ioPrio)
 	}
 	if L.haveTmout {
 		summary += fmt.Sprintf(" timeout=%s", L.timeout)

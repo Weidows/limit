@@ -46,6 +46,8 @@ type limits struct {
 	haveAff     bool
 	prio        string
 	havePrio    bool
+	ioPrio      string
+	haveIoPrio  bool
 	killOnClose bool
 }
 
@@ -201,16 +203,20 @@ func usage(me string) {
 	eprintf("                      不给盘符 = 所有固定卷; 也可 --iops 200 D: E: 只盯这两盘\n")
 	eprintf("                      任一被盯的盘超目标就冻结整棵树; 同一物理盘只算一次\n")
 	eprintf("                      顺序大文件事务少 → 几乎无感; 大量小文件事务多 → 压得最狠\n")
+	eprintf("                      注意: 靠占空比挂起/恢复进程实现, 极小概率让目标卡在内核等待(实测出现过);\n")
+	eprintf("                      大文件负载本来就不需要它, 只想让路请用 --io-prio verylow(不挂起)\n")
 	eprintf("                      吞吐天花板 ≈ 目标 × 平均 IO 大小(200/s: 4KB≈0.8MB/s, 1MB≈200MB/s)\n")
 	eprintf("  --procs <个数>      进程数上限\n")
 	eprintf("  --affinity <掩码>   CPU 亲和性, 如 0x0F 或 0,2-5\n")
 	eprintf("  --prio <级别>       idle|below|normal|above|high\n")
+	eprintf("  --io-prio <级别>    IO 优先级 verylow|low|normal|high —— 让路给其他程序, 不挂起进程(最安全)\n")
 	eprintf("  --timeout <时长>    超时后终止整棵树并返回 124, 如 90s / 10m / 1h(纯数字=秒)\n")
 	eprintf("  --no-kill-on-close  limit 被杀时不让子进程陪葬(默认陪葬)\n")
 	eprintf("\n示例: %s --cpu 25%% --mem 2G -- 7z x big.7z -oD:\\out\n", me)
 	eprintf("      %s --io 50 -- robocopy S:\\ D:\\ /E /J\n", me)
 	eprintf("      %s --iops 200 D: E: -- robocopy S:\\ D:\\backup /E   (任一盘超 200 事务/s 就压)\n", me)
 	eprintf("      %s --timeout 2h -- robocopy S:\\ D:\\backup /E /J    (2 小时后强制收工)\n", me)
+	eprintf("      %s --io-prio verylow -- robocopy S:\\ D:\\backup /E /J (后台慢慢拷, 不抢前台 IO)\n", me)
 }
 
 // ---------- main ----------
@@ -311,6 +317,16 @@ optLoop:
 				return 2
 			}
 			L.timeout, L.haveTmout = v, true
+			i += 2
+		case a == "--io-prio" && i+1 < len(args):
+			p := strings.ToLower(args[i+1])
+			switch p {
+			case "verylow", "low", "normal", "high":
+				L.ioPrio, L.haveIoPrio = p, true
+			default:
+				eprintf("[limit] --io-prio 值无效: %s (verylow|low|normal|high)\n", args[i+1])
+				return 2
+			}
 			i += 2
 		case a == "--no-kill-on-close":
 			L.killOnClose = false
