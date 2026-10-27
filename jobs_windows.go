@@ -457,12 +457,17 @@ func (f *freezer) refresh() {
 	f.lastRefresh = time.Now()
 }
 
-func (f *freezer) set(on bool) {
+// set 返回 false 表示手上没有可挂起的进程句柄(目标已退出), 调用方别把它当「已冻结」记账。
+func (f *freezer) set(on bool) bool {
 	if on == f.frozen {
-		return
+		return true
 	}
 	if len(f.handles) == 0 || time.Since(f.lastRefresh) > iopsPidRefresh {
 		f.refresh()
+	}
+	if len(f.handles) == 0 {
+		f.frozen = on
+		return false
 	}
 	for _, h := range f.handles {
 		if on {
@@ -472,6 +477,7 @@ func (f *freezer) set(on bool) {
 		}
 	}
 	f.frozen = on
+	return true
 }
 
 func (f *freezer) close() {
@@ -623,6 +629,8 @@ func (s *iopsLimiter) run() func() *iopsReport {
 		prevT := time.Now()
 		tickStart := prevT
 		var frozenInTick time.Duration
+		frozenRound := false // 上一轮是否以「冻结」收尾
+		budgetHits := 0      // 连续多少个采样周期把冻结预算用满
 		for {
 			select {
 			case <-s.stopCh:
@@ -656,7 +664,15 @@ func (s *iopsLimiter) run() func() *iopsReport {
 				if rate > w.max {
 					w.max = rate
 				}
-				w.debt += delta - s.target*dt
+				if frozenRound {
+					// 冻结期间观测到的增量是「在途 IO 完成 + 别的程序」, 不是我们新发出的
+					// 请求。计费会把它算成我们的欠账, 于是 debt 永远还不清 → 占空比拉满、
+					// 目标 100/s 时自然率只有 83/s 也照冻(实测 80%+ 占空比、整盘只剩 19/s)。
+					// 这一段只按目标预算偿还, 不累加 delta。
+					w.debt -= s.target * dt
+				} else {
+					w.debt += delta - s.target*dt
+				}
 				if w.debt < 0 {
 					w.debt = 0
 				} else if cap := s.target * iopsDebtCap; w.debt > cap {
@@ -667,11 +683,12 @@ func (s *iopsLimiter) run() func() *iopsReport {
 				}
 			}
 			if worst < 0.003 {
+				budgetHits = 0
 				// 达标: 补满本次采样周期, 让目标进程全速跑
 				if r := iopsTick - time.Since(tickStart); r > 0 {
 					time.Sleep(r)
 				}
-				tickStart, frozenInTick = time.Now(), 0
+				tickStart, frozenInTick, frozenRound = time.Now(), 0, false
 				continue
 			}
 			// 还债: 按 need = 欠账/目标 冻结, 分块(5ms..250ms), 冻完立刻复采样
@@ -686,19 +703,27 @@ func (s *iopsLimiter) run() func() *iopsReport {
 				frz = left
 			}
 			if frz <= 0 {
-				// 本周期冻结预算用尽: 让出去一小会再继续, 并只告警一次
-				s.warnOnce()
+				// 本周期冻结预算用尽: 让出去一小会再继续; 连续多周期都这样才告警
+				if budgetHits++; budgetHits >= 3 {
+					s.warnOnce()
+				}
 				if r := iopsTick - time.Since(tickStart); r > 0 {
 					time.Sleep(r)
 				}
-				tickStart, frozenInTick = time.Now(), 0
+				tickStart, frozenInTick, frozenRound = time.Now(), 0, false
 				continue
 			}
-			s.frz.set(true)
+			if !s.frz.set(true) {
+				// 目标进程已退出(或拿不到句柄): 别空转, 让出去一个采样周期
+				time.Sleep(iopsTick)
+				tickStart, frozenInTick, frozenRound = time.Now(), 0, false
+				continue
+			}
 			time.Sleep(frz)
 			s.frz.set(false)
 			frozenInTick += frz
 			s.frozenTotal += frz
+			frozenRound = true
 		}
 	}()
 	return func() *iopsReport {
@@ -729,8 +754,8 @@ func (s *iopsLimiter) warnOnce() {
 		return
 	}
 	s.warned = true
-	eprintf("[limit] 警告: 冻结占空比已拉满仍压不住 —— 整盘其他程序的 IO 高于目标 %.0f/s, "+
-		"或目标设得过低; 已保持最大压制继续运行\n", s.target)
+	eprintf("[limit] 提示: 已连续把冻结预算(约 98%%)用满 —— 目标 %.0f/s 低于该负载的自然事务率, "+
+		"任务会明显变慢; 想让它跑快点就把目标调高(先跑 --iops 1000000 看自然事务率)\n", s.target)
 }
 
 // describe 供启动摘要行使用, 形如 "iops<=200/s@[1 d:, 0 e:]"。
